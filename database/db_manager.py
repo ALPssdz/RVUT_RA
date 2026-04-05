@@ -38,11 +38,46 @@ class DBManager:
         conn.commit()
         conn.close()
 
+    def _manage_storage(self):
+        """
+        【自动生命周期冷热淘汰管理机制 (LRU Size Control)】
+        确保无人值守雷达长时间运行时不会耗尽主板硬盘。一旦事件总账逼近峰值，剥离历史重负。
+        物理定界：最大保留记录 1000 条。超标自动物理删除最老的 100 张抓拍图片与关联事务。
+        """
+        max_records = 1000
+        prune_count = 100
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM alerts")
+        count = cursor.fetchone()[0]
+        
+        if count > max_records:
+            cursor.execute("SELECT id, image_path FROM alerts ORDER BY id ASC LIMIT ?", (prune_count,))
+            old_rows = cursor.fetchall()
+            
+            for row_id, img_path in old_rows:
+                if os.path.exists(img_path):
+                    try:
+                        os.remove(img_path)
+                    except Exception:
+                        pass
+                cursor.execute("DELETE FROM alerts WHERE id=?", (row_id,))
+                
+            conn.commit()
+            print(f"[Database] 自持存储边界已触发。系统已自动剥离并摧毁最老的 {prune_count} 个远古侦测目标。")
+            
+        conn.close()
+
     def log_alert(self, freq_mhz, score, bgr_image):
         """
         向磁盘映射生成的联合模态监控事件序列图，并在关系型数据库内顺次进行实体注册。
         返回本地日志事务流中自增衍生的唯一索引 ID 号。
         """
+        # [调用物理容量限流器]
+        self._manage_storage()
+        
         now = datetime.now()
         timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
         timestamp_file = now.strftime("%Y%m%d_%H%M%S")

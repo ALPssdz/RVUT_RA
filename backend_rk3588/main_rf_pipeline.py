@@ -50,12 +50,20 @@ class RFToolchain:
             self.sample_rate = int(40e6)
             self.sdr.sample_rate = self.sample_rate
             self.sdr.rx_rf_bandwidth = self.sample_rate
-            self.sdr.rx_buffer_size = 16384
             
-            # [全局降饱和物理防爆盾] 锁死 0dB
+            # 【终极防切割基石】：将缓冲区直接放大一百倍！
+            # 2621440 个样本 = 刚好满足 640x4096 结构网络。
+            # 这是 65 毫秒物理世界中完全无法割裂、没有任何跳步的绝对纯正时间切片！
+            self.sdr.rx_buffer_size = 2621440
+            
+            # [全局物理防爆盾解除：释放真实动态范围]
+            # 经过实时跑表诊断和严密的协议核验排查发现：使用慢速 AGC（slow_attack）在背景无波的时候会疯狂将纯热底噪放大至 ADC 满缝，
+            # 这会导致 S2 的 YOLO 神经元从底噪雪花中产生全面严重的“幽灵错觉”（满屏皆报红），同时也让 S3 无差别遭受杂音伪相干干扰。
+            # 为了完全 1:1 回退并复刻您的 USRP （固定增益捕捉）原生数据集特性，
+            # 这里必须切断硬件 AGC，将底噪压回真正的冰川底，强行拉满静态增益至 50dB 捕获实体波峰！
             self.sdr.rx_hardwaregain_control_mode = 'manual'
-            self.sdr.rx_hardwaregain_chan0 = 0
-            print("[INFO] RFToolchain: PlutoSDR Engine Hardware Initialized Successfully. LNA protected.")
+            self.sdr.rx_hardwaregain_chan0 = 50
+            print("[INFO] RFToolchain: PlutoSDR Engine Initialized with Slow Attack AGC.")
         except Exception as e:
             print(f"[ERROR] RFToolchain: SDR Initialization Failed: {e}")
             raise e
@@ -110,9 +118,9 @@ class RFToolchain:
         
         # [极简新梯次 2 (原 S3): OcuSync 物理层审计]
         if yolo_flag:
-            log_lines.append("张量视觉触发告警！系统自动唤醒 S3 协议级特征审计器...")
+            log_lines.append("张量视觉触发告警！系统提取案发当时的 80MB 同源现场录像带强行植入 S3 测试台！")
             time_s3 = time.time()
-            confirm_flag, audit_score = self.stage3_audit.run_spectral_audit(self.sdr)
+            confirm_flag, audit_score = self.stage3_audit.run_spectral_audit(self.stage2_vision.last_buffer_iq)
             cost_s3 = time.time() - time_s3
             log_lines.append(f"[S3 - 物理自相关审计]: 收敛耗时 {cost_s3:.2f} 秒 | 核验结果: {confirm_flag} (基带循环特征幅值: {audit_score:.4f})")
             

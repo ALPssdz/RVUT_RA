@@ -73,13 +73,13 @@ class CentralHubEngine(QObject):
     def mock_k230_trigger(self, state):
         self.k230_client.mock_drone_detected = state
 
-    def _trigger_composite_save(self, reason_tag):
+    def _trigger_composite_save(self, reason_tag, freq_mhz, score):
         """ 执行视觉与射频张量的图像空间拼接矩阵生成，并向子文件模块抛出无界面异步落盘指令。 """
         import cv2
         fused_evidence = np.hstack([self.cache_rf, self.cache_vis])
         cv2.putText(fused_evidence, f"ALARM REASON: {reason_tag}", (20, 600), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
         
-        new_id = self.db_engine.log_alert(999.0, 1.0, fused_evidence)
+        new_id = self.db_engine.log_alert(freq_mhz, score, fused_evidence)
         self.signal_log.emit(f"持久化操作：事件证据标的 [REC-{new_id}] 标签属性 ({reason_tag}) 已完成写入。")
         
         # 通知异步界面的前端模型重新加载历史缓存
@@ -98,7 +98,9 @@ class CentralHubEngine(QObject):
                     
                 if rf_alert:
                     self.signal_system_status.emit({"system": "Alert: Unusual RF Comm Link", "color": "#e74c3c"})
-                    self._trigger_composite_save("SDR_OMNI_TRIGGER")
+                    freq = rf_info.get("freq_mhz", 0.0)
+                    score = rf_info.get("score", 0.0)
+                    self._trigger_composite_save("SDR_OMNI_TRIGGER", freq, score)
             except Exception as e:
                 self.signal_log.emit(f"SDR 射频传感器寻址异常: {e}")
                 
@@ -115,7 +117,7 @@ class CentralHubEngine(QObject):
                         
                     self.signal_system_status.emit({"system": "特征命中：目标物理轮廓验证通过", "color": "#e74c3c"})
                     self.signal_log.emit("OOB 触发器：高速网络侧带外接收到正向标定数据包。")
-                    self._trigger_composite_save("K230_ZENITH_TRIGGER")
+                    self._trigger_composite_save("K230_ZENITH_TRIGGER", 0.0, 1.0)
                 
                 self.cache_vis = k_frame
                 self.signal_k230_frame.emit(k_frame)
@@ -136,3 +138,27 @@ if __name__ == "__main__":
     exit_code = app.exec_()
     hub.shutdown()
     sys.exit(exit_code)
+
+# ==============================================================================
+# [DEBUG ONLY 临时隔离运行区块]: 关闭主控时自动清理历史调试污染数据
+# 注意：在完成所有早期开发与算法测试后，请直接注释下方的 atexit 注册块。
+# 本代码块确保即使主进程被异常强杀（Ctrl+C 或报错闪退），也能坚定触发垃圾强制回收！
+# ==============================================================================
+""" import atexit
+import subprocess
+import os
+
+def _auto_clean_debug_traces():
+    print("\n[HOOK] 主控引擎开始降下帷幕，正在自动拉起清道夫 (clean_debug_data.bat)...")
+    bat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clean_debug_data.bat")
+    
+    if os.path.exists(bat_path):
+        try:
+            # 采用静默的 shell 衍生执行，防止终端阻塞
+            subprocess.run(f'cmd /c "{bat_path}"', shell=True)
+            print("[HOOK] 数据库垃圾强制排空完毕，主控安全释放所有内存！")
+        except Exception as e:
+            print(f"[!] 清除脚本应急调用断帧故障: {e}")
+
+atexit.register(_auto_clean_debug_traces) """
+# ==============================================================================
