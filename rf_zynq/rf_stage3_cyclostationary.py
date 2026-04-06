@@ -101,9 +101,10 @@ class RF_Stage3_CycloAudit:
         self.sample_rate = float(sample_rate)
         self._freq_res   = None   # set on first run_spectral_audit call
 
-        # Load field-calibrated thresholds from JSON if available.
-        # The JSON is written by calibrate_s3.py and is git-ignored,
-        # so the source file is never modified by calibration.
+        # Per-sector calibrated thresholds: {freq_hz_int: (th_30k, th_15k)}
+        # Populated from s3_thresholds.json (git-ignored, written by calibrate_s3.py).
+        # Falls back to class-level defaults when JSON is absent.
+        self._sector_thresholds: dict = {}
         import os, json
         _json = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "s3_thresholds.json")
@@ -111,11 +112,23 @@ class RF_Stage3_CycloAudit:
             try:
                 with open(_json) as _f:
                     _t = json.load(_f)
-                self.THRESHOLD_30K = float(_t["THRESHOLD_30K"])
-                self.THRESHOLD_15K = float(_t["THRESHOLD_15K"])
-                print(f"  [S3] Thresholds loaded from JSON: "
-                      f"30k={self.THRESHOLD_30K*100:.2f}%  "
-                      f"15k={self.THRESHOLD_15K*100:.2f}%")
+                # New per-sector format: {"sectors": {"5745000000": {"th_30k":..., "th_15k":...}}}
+                if "sectors" in _t:
+                    for k, v in _t["sectors"].items():
+                        self._sector_thresholds[int(k)] = (
+                            float(v["th_30k"]), float(v["th_15k"])
+                        )
+                    print("  [S3] Per-sector thresholds loaded from JSON:")
+                    for f, (t30, t15) in self._sector_thresholds.items():
+                        print(f"       {f/1e6:.0f} MHz  "
+                              f"30k={t30*100:.2f}%  15k={t15*100:.2f}%")
+                else:
+                    # Legacy flat format (single global threshold)
+                    self.THRESHOLD_30K = float(_t["THRESHOLD_30K"])
+                    self.THRESHOLD_15K = float(_t["THRESHOLD_15K"])
+                    print(f"  [S3] Global thresholds loaded (legacy JSON): "
+                          f"30k={self.THRESHOLD_30K*100:.2f}%  "
+                          f"15k={self.THRESHOLD_15K*100:.2f}%")
             except Exception as _e:
                 print(f"  [S3] Failed to load s3_thresholds.json ({_e}), using defaults.")
 
@@ -262,29 +275,35 @@ class RF_Stage3_CycloAudit:
     # =========================================================================
     # 公开接口
     # =========================================================================
-    def run_spectral_audit(self, iq_data_buffer) -> tuple:
+    def run_spectral_audit(self, iq_data_buffer,
+                           sector_hz: float = None) -> tuple:
         """
-        对输入 IQ 缓冲区执行完整的 CAF-FFT 循环频率审计。
-
-        检测流程（四级漏斗）：
-          Level 1  帧级 CAF 扫描 → 每帧提取 OcuSync 30k/15k 两通道 NCC 峰值
-          Level 2  联合统计判决 → combined = α·peak + (1-α)·avg > 动态阈值
-          Level 3  τ 域 PSR 验证 → 峰值旁瓣比确认 CP Delta 冲激特征
-          Level 4  α 域 CFS 验证 → 循环频率集中度排除宽频扰动（可选加严）
-
-        WiFi 干扰抑制原理（无需任何启发式规则）：
-          IEEE 802.11 的循环频率为 250 kHz，在 OcuSync 的 18~32 kHz 扫描窗口
-          之外，CAF 正交性使其泄漏幅度 ≈ 0.028%（即使 WiFi 强 20 dB 也无碍）。
+        Full CAF-FFT cyclic-frequency audit on the input IQ buffer.
 
         Parameters
         ----------
         iq_data_buffer : array-like
-            AD9364 ADC 原始整数 IQ 数据（int16，复数或交织格式均可）
+            Raw int16 IQ samples from AD9364 ADC.
+        sector_hz : float, optional
+            Current RX center frequency (Hz).  When supplied and a
+            per-sector calibration exists in s3_thresholds.json, the
+            sector-specific threshold is applied instead of the global
+            class-level default, maximising sensitivity on clean sectors
+            while respecting higher interference floors on noisy ones.
 
         Returns
         -------
-        (bool, float) : (检测结果, 最大 NCC 系数)
+        (bool, float) : (detection result, peak NCC coefficient)
         """
+        # -- Resolve active thresholds per sector --------------------------------
+        if sector_hz is not None and self._sector_thresholds:
+            key = min(self._sector_thresholds,
+                      key=lambda k: abs(k - int(sector_hz)))
+            th_30k_active, th_15k_active = self._sector_thresholds[key]
+        else:
+            th_30k_active = self.THRESHOLD_30K
+            th_15k_active = self.THRESHOLD_15K
+
         buf           = np.asarray(iq_data_buffer)
         total_samples = len(buf)
         step_size     = int(self.CHUNK_SIZE * (1.0 - self.OVERLAP))
@@ -345,9 +364,9 @@ class RF_Stage3_CycloAudit:
         print(
             f"  [S3-v3] {len(frames_30k)} frames | "
             f"OcuSync30k: peak={peak_30k*100:.2f}% avg={avg_30k*100:.2f}% "
-            f"→ combined={combined_30k*100:.2f}% (th={self.THRESHOLD_30K*100:.1f}%) | "
+            f"-> combined={combined_30k*100:.2f}% (th={th_30k_active*100:.1f}%) | "
             f"OcuSync15k: peak={peak_15k*100:.2f}% avg={avg_15k*100:.2f}% "
-            f"→ combined={combined_15k*100:.2f}% (th={self.THRESHOLD_15K*100:.1f}%) | "
+            f"-> combined={combined_15k*100:.2f}% (th={th_15k_active*100:.1f}%) | "
             f"WiFi@250kHz(monitor)={wifi_ncc*100:.2f}%"
         )
 
@@ -355,14 +374,14 @@ class RF_Stage3_CycloAudit:
         triggered_ch  = None    # '30k' 或 '15k'
         triggered_score = 0.0
 
-        if combined_30k >= self.THRESHOLD_30K:
-            if combined_30k >= combined_15k or combined_15k < self.THRESHOLD_15K:
+        if combined_30k >= th_30k_active:
+            if combined_30k >= combined_15k or combined_15k < th_15k_active:
                 triggered_ch    = '30k'
                 triggered_score = combined_30k
             else:
                 triggered_ch    = '15k'
                 triggered_score = combined_15k
-        elif combined_15k >= self.THRESHOLD_15K:
+        elif combined_15k >= th_15k_active:
             triggered_ch    = '15k'
             triggered_score = combined_15k
 

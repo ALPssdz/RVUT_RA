@@ -215,7 +215,8 @@ class RFToolchain:
         # ── Stage 3：循环谱物理层审计 ─────────────────────────────────────────
         t1 = time.time()
         confirm_flag, audit_score = self.stage3_audit.run_spectral_audit(
-            self.stage2_vision.last_buffer_iq
+            self.stage2_vision.last_buffer_iq,
+            sector_hz=active_freq,
         )
         cost_s3 = time.time() - t1
         log_lines.append(

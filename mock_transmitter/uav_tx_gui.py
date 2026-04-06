@@ -590,16 +590,27 @@ class UAVTransmitterWindow(QMainWindow):
         # 跳频开关
         self._chk_hopping = QCheckBox("启用三扇区跳频（5745 / 5785 / 5825 MHz）")
         self._chk_hopping.setChecked(True)
+        self._chk_hopping.stateChanged.connect(self._on_hopping_toggled)
         lay.addWidget(self._chk_hopping)
+
+        # 单频扇区选择（仅关闭跳频时显示）
+        self._row_single_sector = QHBoxLayout()
+        self._row_single_sector.addWidget(QLabel("发射扇区："))
+        self._combo_sector = QComboBox()
+        for lbl in SECTOR_LABELS:
+            self._combo_sector.addItem(lbl)
+        self._row_single_sector.addWidget(self._combo_sector)
+        lay.addLayout(self._row_single_sector)
+        self._set_single_sector_visible(False)   # 默认跳频模式，隐藏桇区选择框
 
         # 驻留时间
         h1 = QHBoxLayout()
         h1.addWidget(QLabel("扇区驻留时长："))
         self._spin_dwell = QDoubleSpinBox()
-        self._spin_dwell.setRange(500.0, 60000.0)    # 最短 0.5 s，最长 60 s
+        self._spin_dwell.setRange(500.0, 60000.0)
         self._spin_dwell.setValue(DEFAULT_DWELL_MS)
         self._spin_dwell.setSuffix("  ms")
-        self._spin_dwell.setSingleStep(500.0)        # 每次调整 0.5 s
+        self._spin_dwell.setSingleStep(500.0)
         h1.addWidget(self._spin_dwell)
         lay.addLayout(h1)
 
@@ -615,6 +626,17 @@ class UAVTransmitterWindow(QMainWindow):
         lay.addLayout(h2)
 
         return grp
+
+    def _set_single_sector_visible(self, visible: bool):
+        """Show/hide the single-sector combo row."""
+        for i in range(self._row_single_sector.count()):
+            w = self._row_single_sector.itemAt(i).widget()
+            if w:
+                w.setVisible(visible)
+
+    def _on_hopping_toggled(self, state):
+        hopping = (state == Qt.Checked)
+        self._set_single_sector_visible(not hopping)
 
     def _build_action_group(self) -> QGroupBox:
         grp = QGroupBox("发射控制")
@@ -788,11 +810,12 @@ class UAVTransmitterWindow(QMainWindow):
     def _push_params_to_worker(self):
         """将 GUI 当前参数同步至 TxWorker。"""
         hop_en = self._chk_hopping.isChecked()
-        sectors_hz = (
-            [f * 1e6 for f in SECTOR_FREQS_MHZ]
-            if hop_en
-            else [SECTOR_FREQS_MHZ[0] * 1e6]
-        )
+        if hop_en:
+            sectors_hz = [f * 1e6 for f in SECTOR_FREQS_MHZ]
+        else:
+            # 用户选定的单个扇区
+            idx = self._combo_sector.currentIndex()
+            sectors_hz = [SECTOR_FREQS_MHZ[idx] * 1e6]
         params = {
             "uri":          self._edit_uri.text().strip(),
             "fs":           DEFAULT_FS_MHZ,

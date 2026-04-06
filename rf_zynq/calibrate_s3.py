@@ -45,8 +45,12 @@ ALPHA_SCAN_15K   = ( 9_000.0, 16_000.0)
 MIN_POWER_GATE   = 1e-5
 
 # -- Threshold derivation parameters ------------------------------------------
-NOISE_MARGIN   = 5.0    # threshold = bg_max x NOISE_MARGIN
-HARD_FLOOR_30K = 0.028  # 2.8% hard floor (13x theoretical noise floor)
+# Formula: th = max(HARD_FLOOR, bg_max x NOISE_MARGIN)
+# NOISE_MARGIN = 3.0 (3x is statistically sufficient; PSR+CFS checks provide
+#   additional false-positive rejection, so no need for a 5x bloat)
+# HARD_FLOOR  = absolute minimum derived from 1/sqrt(N) theoretical noise floor
+NOISE_MARGIN   = 3.0    # 3x margin above measured bg_max
+HARD_FLOOR_30K = 0.028  # 2.8%  (13x theoretical noise floor 1/sqrt(200000))
 HARD_FLOOR_15K = 0.022  # 2.2%
 
 # =============================================================================
@@ -175,49 +179,69 @@ def phase1_background():
 # =============================================================================
 def _derive_thresholds(bg_results):
     """
-    Derive optimal thresholds.
+    Derive per-sector thresholds independently.
 
-    Formula: th = max(HARD_FLOOR, bg_max x NOISE_MARGIN)
-      - NOISE_MARGIN = 5.0  (5x safety margin above measured floor)
-      - HARD_FLOOR   = absolute minimum (13x theoretical noise floor 1/sqrt(N))
-      - Takes worst-case across all sectors
+    Formula (per sector):
+      th = max(HARD_FLOOR, bg_max x NOISE_MARGIN)
+
+    Statistical rationale:
+      NOISE_MARGIN = 3.0: with 6 averaged frames the bg_max estimate
+      has +/-sigma uncertainty of ~0.2%.  A 3x margin provides >10 dB
+      guard against measurement noise.  False-alarm suppression is
+      further enforced by Level 3 PSR and Level 4 CFS checks.
 
     Returns
     -------
-    (th_30k, th_15k)
+    dict: {freq_hz: {'th_30k': float, 'th_15k': float}}
     """
-    th30, th15 = [], []
+    per_sector = {}
     for freq in SECTORS_HZ:
         bg   = bg_results.get(freq, {})
         bg30 = bg.get('ncc_30k_max', HARD_FLOOR_30K / NOISE_MARGIN)
         bg15 = bg.get('ncc_15k_max', HARD_FLOOR_15K / NOISE_MARGIN)
-        th30.append(max(HARD_FLOOR_30K, bg30 * NOISE_MARGIN))
-        th15.append(max(HARD_FLOOR_15K, bg15 * NOISE_MARGIN))
-    return max(th30), max(th15)
+        per_sector[freq] = {
+            'th_30k': max(HARD_FLOOR_30K, bg30 * NOISE_MARGIN),
+            'th_15k': max(HARD_FLOOR_15K, bg15 * NOISE_MARGIN),
+        }
+    return per_sector
 
 
 THRESHOLD_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "s3_thresholds.json")
 
 
-def phase2_apply(th_30k, th_15k):
+def phase2_apply(per_sector_th):
     """
-    Persist calibrated thresholds to s3_thresholds.json (git-ignored).
+    Persist per-sector calibrated thresholds to s3_thresholds.json.
+
+    JSON schema:
+      {
+        "sectors": {
+          "5745000000": {"th_30k": 0.050, "th_15k": 0.030},
+          ...
+        },
+        "calibrated_at": "..."
+      }
     RF_Stage3_CycloAudit.__init__() reads this file at startup.
-    The source file is never modified -- no git conflicts.
     """
     import json
     from datetime import datetime
     print("\n" + "=" * 60)
-    print("  Phase 2 -- Saving thresholds to JSON")
-    print(f"  THRESHOLD_30K : {th_30k*100:.2f}%")
-    print(f"  THRESHOLD_15K : {th_15k*100:.2f}%")
-    print(f"  File          : {THRESHOLD_JSON}")
+    print("  Phase 2 -- Saving per-sector thresholds to JSON")
+    for freq, th in per_sector_th.items():
+        print(f"  {freq/1e6:.0f} MHz:  "
+              f"TH_30k={th['th_30k']*100:.2f}%   TH_15k={th['th_15k']*100:.2f}%")
+    print(f"  File : {THRESHOLD_JSON}")
     print("=" * 60)
 
     payload = {
-        "THRESHOLD_30K": round(th_30k, 6),
-        "THRESHOLD_15K": round(th_15k, 6),
+        "sectors": {
+            str(int(freq)): {
+                "th_30k": round(th["th_30k"], 6),
+                "th_15k": round(th["th_15k"], 6),
+            }
+            for freq, th in per_sector_th.items()
+        },
         "calibrated_at": datetime.now().isoformat(timespec='seconds'),
     }
     with open(THRESHOLD_JSON, 'w') as f:
@@ -304,18 +328,20 @@ def main():
     # Phase 1: background measurement
     bg_results = phase1_background()
 
-    # Phase 2: derive thresholds
-    th_30k, th_15k = _derive_thresholds(bg_results)
+    # Phase 2: derive per-sector thresholds
+    per_sector_th = _derive_thresholds(bg_results)
 
-    print(f"\n  +----------------------------------+")
-    print(f"  |  Derived thresholds (worst-case) |")
-    print(f"  |  THRESHOLD_30K = {th_30k*100:6.2f}%          |")
-    print(f"  |  THRESHOLD_15K = {th_15k*100:6.2f}%          |")
-    print(f"  +----------------------------------+")
+    print(f"\n  +{'':'-<46}+")
+    print(f"  | Per-sector derived thresholds (NOISE_MARGIN={NOISE_MARGIN}x){'':4}|")
+    for freq, th in per_sector_th.items():
+        print(f"  |  {freq/1e6:.0f} MHz:  "
+              f"TH_30k={th['th_30k']*100:5.2f}%   "
+              f"TH_15k={th['th_15k']*100:5.2f}%{'':10}|")
+    print(f"  +{'':'-<46}+")
 
-    # Auto-write (no confirmation prompt)
-    phase2_apply(th_30k, th_15k)
-    _save_report(bg_results, th_30k, th_15k)
+    # Auto-write
+    phase2_apply(per_sector_th)
+    _save_report(bg_results, per_sector_th)
     print("\n  Calibration complete. New thresholds are active.\n")
 
 

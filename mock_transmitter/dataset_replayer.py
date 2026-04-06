@@ -46,35 +46,62 @@ _DATASET_ROOT = os.path.join(
 )
 
 DRONE_CATALOG = {
+    # ── DJI Mini 4 Pro ──────────────────────────────────────────────────────
     "DJI Mini 4 Pro  [BW=20MHz]": {
-        "path":    os.path.join(_DATASET_ROOT, "DJI MINI4 PRO", "VTSBW=20"),
-        "pack":    "pack2",
-        "bw_mhz": 20,
+        "path":   os.path.join(_DATASET_ROOT, "DJI MINI4 PRO", "VTSBW=20"),
+        "pack":   "pack2", "bw_mhz": 20,
     },
     "DJI Mini 4 Pro  [BW=10MHz]": {
-        "path":    os.path.join(_DATASET_ROOT, "DJI MINI4 PRO", "VTSBW=10"),
-        "pack":    "pack1",
-        "bw_mhz": 10,
+        "path":   os.path.join(_DATASET_ROOT, "DJI MINI4 PRO", "VTSBW=10"),
+        "pack":   "pack1", "bw_mhz": 10,
     },
+    # ── DJI Mini 3 ──────────────────────────────────────────────────────────
     "DJI Mini 3      [BW=20MHz]": {
-        "path":    os.path.join(_DATASET_ROOT, "DJI MINI3", "VTSBW=20"),
-        "pack":    "pack2",
-        "bw_mhz": 20,
+        "path":   os.path.join(_DATASET_ROOT, "DJI MINI3", "VTSBW=20"),
+        "pack":   "pack2", "bw_mhz": 20,
     },
     "DJI Mini 3      [BW=10MHz]": {
-        "path":    os.path.join(_DATASET_ROOT, "DJI MINI3", "VTSBW=10"),
-        "pack":    "pack2",
-        "bw_mhz": 10,
+        "path":   os.path.join(_DATASET_ROOT, "DJI MINI3", "VTSBW=10"),
+        "pack":   "pack2", "bw_mhz": 10,
     },
+    # ── DJI Mavic 3 Pro ─────────────────────────────────────────────────────
     "DJI Mavic 3 Pro [BW=20MHz]": {
-        "path":    os.path.join(_DATASET_ROOT, "DJI MAVIC3 PRO", "VTSBW=20"),
-        "pack":    "pack2",
-        "bw_mhz": 20,
+        "path":   os.path.join(_DATASET_ROOT, "DJI MAVIC3 PRO", "VTSBW=20"),
+        "pack":   "pack2", "bw_mhz": 20,
     },
     "DJI Mavic 3 Pro [BW=10MHz]": {
-        "path":    os.path.join(_DATASET_ROOT, "DJI MAVIC3 PRO", "VTSBW=10"),
-        "pack":    "pack1",
-        "bw_mhz": 10,
+        "path":   os.path.join(_DATASET_ROOT, "DJI MAVIC3 PRO", "VTSBW=10"),
+        "pack":   "pack1", "bw_mhz": 10,
+    },
+    # ── DJI Avata 2 ─────────────────────────────────────────────────────────
+    "DJI Avata 2     [BW=20MHz]": {
+        "path":   os.path.join(_DATASET_ROOT, "DJI AVATA2", "VTSBW=20"),
+        "pack":   "pack2", "bw_mhz": 20,
+    },
+    "DJI Avata 2     [BW=10MHz]": {
+        "path":   os.path.join(_DATASET_ROOT, "DJI AVATA2", "VTSBW=10"),
+        "pack":   "pack1", "bw_mhz": 10,
+    },
+    "DJI Avata 2     [BW=40MHz]": {
+        "path":   os.path.join(_DATASET_ROOT, "DJI AVATA2", "VTSBW=40"),
+        "pack":   "pack4", "bw_mhz": 40,
+    },
+    "DJI Avata 2     [BW=60MHz]": {
+        "path":   os.path.join(_DATASET_ROOT, "DJI AVATA2", "VTSBW=60"),
+        "pack":   "pack3", "bw_mhz": 60,
+    },
+    # ── DJI FPV Combo ───────────────────────────────────────────────────────
+    "DJI FPV Combo   [BW=20MHz]": {
+        "path":   os.path.join(_DATASET_ROOT, "DJI FPV COMBO", "VTSBW=20"),
+        "pack":   "pack3", "bw_mhz": 20,
+    },
+    "DJI FPV Combo   [BW=10MHz]": {
+        "path":   os.path.join(_DATASET_ROOT, "DJI FPV COMBO", "VTSBW=10"),
+        "pack":   "pack1", "bw_mhz": 10,
+    },
+    "DJI FPV Combo   [BW=40MHz]": {
+        "path":   os.path.join(_DATASET_ROOT, "DJI FPV COMBO", "VTSBW=40"),
+        "pack":   "pack2", "bw_mhz": 40,
     },
 }
 
