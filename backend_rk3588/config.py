@@ -37,3 +37,4 @@ K230_UDP_PORT   = 8080
 YOLO_BACKEND    = "rknn" if IS_RK3588 else "torch"
 YOLO_RKNN_PATH  = "rf_zynq/yolo/best.rknn"   # RKNN 模型路径（相对于项目根目录）
 YOLO_CONF_THRESH = 0.60                        # 检测置信度阈值
+ 
