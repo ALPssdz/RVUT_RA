@@ -43,16 +43,30 @@ IQ 码流采集（AD9364，采样率 40 MSps，单次捕获 262 万采样点 / 6
     YOLOv8n 在 RK3588 NPU 上运行 RKNN INT8 推理（约 30 ms/帧）。
         │
         ▼
-  第三级 — 循环谱物理层审计（S3）
-    基于 OFDM 循环前缀（CP）时移自相关进行协议指纹识别。
-    OcuSync 2.0（τ=2667，Δf=15 kHz）与 OcuSync 3.0/4.0（τ=1333，Δf=30 kHz）。
-    独立告警判决；Wi-Fi 自适应虚警抑制机制。
+  第三级 — 循环频率判别器（S3）  [v3.0 — CAF-FFT 架构]
+    基于循环自相关函数（CAF）与 FFT 加速 α 扫描，
+    在协议层面将 OcuSync 与 WiFi 彻底分离——即使 WiFi 功率
+    比无人机信号强 20 dB，仍可可靠检测。
+
+    各协议循环频率（Fs = 40 MSps）：
+      OcuSync 2.0（Δf=15 kHz, τ=2667）：α_sym ≈ 12 kHz
+      OcuSync 3.0/4.0（Δf=30 kHz, τ=1333）：α_sym ≈ 24 kHz
+      WiFi 802.11（Δf=312.5 kHz, τ=128）：α_sym = 250 kHz  ← 完全正交
+
+    WiFi 对 OcuSync 检测通道的理论泄漏量（N=200000, Fs=40MHz）：
+      NCC_WiFi ≈ P_WiFi × sinc(1130) ≈ P_WiFi 的 0.028%
+
+    四级漏斗判决流程：
+      L1 — 帧级 CAF-FFT 扫描，提取 OcuSync α 范围内 NCC 峰值
+      L2 — 联合统计判决（peak×0.45 + avg×0.55）> 自适应阈值
+      L3 — τ 域峰值旁瓣比（PSR）≥ 2.5×，鉴别 SMPS 纹波干扰
+      L4 — α 域循环频率集中度（CFS）≥ 1.8×，鉴别宽带杂散
 ```
 
 ## 4. 非对称融合体制设计
 有别于常规布尔 AND 逻辑融合（须两路全通），本系统实施独立异步越位触发机制，最大化预警召回率：
 
-1.  **射频触发（第一类触发源）** — S3 循环谱物理层审计确认 OcuSync 协议指纹后独立触发告警，并生成频谱取证快照。
+1.  **射频触发（第一类触发源）** — S3 CAF-FFT 判别器确认 OcuSync 协议指纹后独立触发告警，并生成循环谱取证快照。
 2.  **视觉信令触发（第二类触发源）** — K230 UDP 遥测独立触发告警，补偿无线电静默或穿越天线零陷的目标。
 
 两类触发路径均生成融合证据复合图（射频瀑布图 + 光学帧），存入 SQLite3 告警数据库。
@@ -68,7 +82,7 @@ RF-Vision-UAV-Tracker/
 ├── rf_zynq/
 │   ├── rf_stage1_rssi_scan.py       # S1：跨扇区 RSSI 快速功率预扫
 │   ├── rf_stage2_waterfall_yolo.py  # S2：IQ → STFT 瀑布图张量生成
-│   ├── rf_stage3_cyclostationary.py # S3：循环谱审计与协议指纹识别
+│   ├── rf_stage3_cyclostationary.py # S3：CAF-FFT 循环频率判别器
 │   └── rknn_infer.py                # RKNN-Lite2 YOLOv8 NPU 推理封装
 ├── vision_k230/
 │   └── k230_client.py       # RTSP 视频流 + UDP 遥测并发网络客户端
@@ -79,7 +93,9 @@ RF-Vision-UAV-Tracker/
 ├── tools/
 │   └── convert_yolo_to_rknn.py  # YOLOv8 → RKNN INT8 离线转换工具
 ├── mock_transmitter/
+│   ├── uav_tx_gui.py        # PlutoSDR 无人机射频靶机控制台（GUI）
 │   └── mock_k230.py         # PC 侧 K230 模拟器（MJPEG 流 + UDP 遥测）
+├── diag_s3_false_positive.py    # S3 环境背景噪声诊断工具
 ├── deploy_orangepi.sh       # 香橙派 5 一键环境装配脚本
 └── start_rf_vision.sh       # 系统一键拉起脚本
 ```
@@ -97,4 +113,20 @@ python tools/convert_yolo_to_rknn.py
 
 # 将 best.rknn 复制至目标路径后启动系统
 python3 system_hub.py
+```
+
+### S3 阈值现场校准（首次部署推荐）
+
+在新射频环境部署后，请在**无人机关机状态**下运行背景诊断工具，
+测量当前环境的 NCC 噪声底：
+
+```bash
+python3 diag_s3_false_positive.py
+```
+
+若实测背景 NCC 超过 1%，按以下准则更新 `rf_zynq/rf_stage3_cyclostationary.py` 中的阈值：
+
+```
+THRESHOLD_30K = max(0.028, 5 × NCC_bg_max_30k)
+THRESHOLD_15K = max(0.022, 5 × NCC_bg_max_15k)
 ```

@@ -43,16 +43,31 @@ IQ Samples (AD9364, 40 MSps, 2.62M samples/burst)
     YOLOv8n inference on RK3588 NPU via RKNN (~30 ms).
         │
         ▼
-  Stage 3 — Cyclostationary Physical-Layer Audit (S3)
-    OFDM cyclic-prefix autocorrelation fingerprinting.
-    OcuSync 2.0 (τ=2667, Δf=15 kHz) and 3.0/4.0 (τ=1333, Δf=30 kHz).
-    Independent alert decision; Wi-Fi adaptive false-alarm suppression.
+  Stage 3 — Cyclic Frequency Discriminator (S3)  [v3.0]
+    Cyclic Autocorrelation Function (CAF) with FFT-accelerated α-scan.
+    Exploits the orthogonality of OFDM cycle frequencies to achieve
+    protocol-level separation between OcuSync and Wi-Fi — even when
+    Wi-Fi is 20 dB stronger than the UAV signal.
+
+    Target cycle frequencies:
+      OcuSync 2.0 (Δf=15 kHz, τ=2667): α_sym = Fs/(N_fft+N_cp) ≈ 12 kHz
+      OcuSync 3.0/4.0 (Δf=30 kHz, τ=1333): α_sym ≈ 24 kHz
+      Wi-Fi 802.11 (Δf=312.5 kHz, τ=128): α_sym = 250 kHz  ← orthogonal
+
+    Wi-Fi leakage into OcuSync channel (N=200000, Fs=40 MHz):
+      NCC_WiFi ≈ P_WiFi · sinc(1130) ≈ 0.028% of Wi-Fi power
+
+    Four-stage decision funnel:
+      L1 — Frame-level CAF peak extraction
+      L2 — Combined statistic (peak×0.45 + avg×0.55) > adaptive threshold
+      L3 — τ-domain PSR (Peak-to-Sidelobe Ratio) ≥ 2.5×
+      L4 — α-domain CFS (Cyclic Frequency Sharpness) ≥ 1.8×
 ```
 
 ## 4. Asymmetric Fusion Methodology
 Differing from conventional Boolean AND-logic fusion, this system implements independent, asynchronous trigger paths to maximize detection recall:
 
-1.  **RF Trigger (Primary)** — S3 cyclostationary audit confirms OcuSync protocol fingerprint and fires an alert with spectral evidence snapshot.
+1.  **RF Trigger (Primary)** — S3 CAF-FFT discriminator confirms OcuSync protocol fingerprint and fires an alert with a cyclic spectrum snapshot.
 2.  **Visual Trigger (Secondary)** — K230 UDP telemetry independently triggers an alert, compensating for UAVs under RF silence or traversing the antenna null.
 
 Both trigger paths produce a fused composite evidence image (RF waterfall + optical frame) stored in the SQLite3 alert database.
@@ -66,10 +81,10 @@ RF-Vision-UAV-Tracker/
 ├── backend_rk3588/
 │   └── main_rf_pipeline.py  # RFToolchain: S1→S2→S3 pipeline controller
 ├── rf_zynq/
-│   ├── rf_stage1_rssi_scan.py      # S1: Fast RSSI frequency scan
-│   ├── rf_stage2_waterfall_yolo.py # S2: IQ → STFT waterfall tensor
-│   ├── rf_stage3_cyclostationary.py# S3: Cyclostationary audit & fingerprinting
-│   └── rknn_infer.py               # RKNN-Lite2 YOLOv8 NPU inference wrapper
+│   ├── rf_stage1_rssi_scan.py       # S1: Fast RSSI frequency scan
+│   ├── rf_stage2_waterfall_yolo.py  # S2: IQ → STFT waterfall tensor
+│   ├── rf_stage3_cyclostationary.py # S3: CAF-FFT cyclic frequency discriminator
+│   └── rknn_infer.py                # RKNN-Lite2 YOLOv8 NPU inference wrapper
 ├── vision_k230/
 │   └── k230_client.py       # RTSP video + UDP telemetry network client
 ├── ui_qt/
@@ -79,7 +94,9 @@ RF-Vision-UAV-Tracker/
 ├── tools/
 │   └── convert_yolo_to_rknn.py  # YOLOv8 → RKNN INT8 offline converter
 ├── mock_transmitter/
+│   ├── uav_tx_gui.py        # PlutoSDR UAV RF target simulator GUI
 │   └── mock_k230.py         # PC-side K230 simulator (MJPEG + UDP)
+├── diag_s3_false_positive.py    # S3 environment background diagnostics tool
 ├── deploy_orangepi.sh       # One-shot Orange Pi 5 environment setup
 └── start_rf_vision.sh       # One-click system launch script
 ```
@@ -97,4 +114,21 @@ python tools/convert_yolo_to_rknn.py
 
 # Copy best.rknn to the target path, then launch
 python3 system_hub.py
+```
+
+### S3 Threshold Calibration (Recommended After Deployment)
+
+Before operating in a new RF environment, run the background diagnostics tool
+with the UAV **powered off** to measure the ambient NCC noise floor:
+
+```bash
+python3 diag_s3_false_positive.py
+```
+
+If the measured background NCC exceeds 1%, adjust the S3 thresholds in
+`rf_zynq/rf_stage3_cyclostationary.py` as follows:
+
+```
+THRESHOLD_30K = max(0.028, 5 × NCC_bg_max_30k)
+THRESHOLD_15K = max(0.022, 5 × NCC_bg_max_15k)
 ```
