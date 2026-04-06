@@ -95,9 +95,11 @@ RF-Vision-UAV-Tracker/
 ├── mock_transmitter/
 │   ├── uav_tx_gui.py        # PlutoSDR 无人机射频靶机控制台（GUI）
 │   └── mock_k230.py         # PC 侧 K230 模拟器（MJPEG 流 + UDP 遥测）
-├── diag_s3_false_positive.py    # S3 环境背景噪声诊断工具
-├── deploy_orangepi.sh       # 香橙派 5 一键环境装配脚本
-└── start_rf_vision.sh       # 系统一键拉起脚本
+├── calibrate_s3.py              # S3 一键现场校准向导（背景测量→阈值计算→自动写入）
+├── diag_s3_false_positive.py    # S3 环境背景噪声全谱诊断工具（底层）
+├── diag_uav_on_calibration.py   # S3 真机信号强度测量工具（底层）
+├── deploy_orangepi.sh           # 香橙派 5 一键环境装配脚本
+└── start_rf_vision.sh           # 系统一键拉起脚本
 ```
 
 ## 6. 部署与装配指南
@@ -117,16 +119,26 @@ python3 system_hub.py
 
 ### S3 阈值现场校准（首次部署推荐）
 
-在新射频环境部署后，请在**无人机关机状态**下运行背景诊断工具，
-测量当前环境的 NCC 噪声底：
+在新射频环境部署后，运行一键校准向导（约 3 分钟完成）：
 
 ```bash
-python3 diag_s3_false_positive.py
+python3 calibrate_s3.py
 ```
 
-若实测背景 NCC 超过 1%，按以下准则更新 `rf_zynq/rf_stage3_cyclostationary.py` 中的阈值：
+向导交互流程：
 
 ```
-THRESHOLD_30K = max(0.028, 5 × NCC_bg_max_30k)
-THRESHOLD_15K = max(0.022, 5 × NCC_bg_max_15k)
+Phase 1 — 背景噪声基线（UAV 关机）
+  → 各扇区 CAF-NCC 环境本底自动测量
+
+Phase 2 — 阈值计算与自动写入
+  → 一键计算最优 THRESHOLD_30K / THRESHOLD_15K
+  → 自动写入 rf_zynq/rf_stage3_cyclostationary.py
+  → 生成校准报告图（database/alert_images/）
+```
+
+校准完成后重启系统，新阈值立即生效：
+
+```bash
+python3 system_hub.py
 ```

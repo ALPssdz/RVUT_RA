@@ -96,9 +96,11 @@ RF-Vision-UAV-Tracker/
 ├── mock_transmitter/
 │   ├── uav_tx_gui.py        # PlutoSDR UAV RF target simulator GUI
 │   └── mock_k230.py         # PC-side K230 simulator (MJPEG + UDP)
-├── diag_s3_false_positive.py    # S3 environment background diagnostics tool
-├── deploy_orangepi.sh       # One-shot Orange Pi 5 environment setup
-└── start_rf_vision.sh       # One-click system launch script
+├── calibrate_s3.py              # S3 one-click field calibration wizard
+├── diag_s3_false_positive.py    # S3 background noise full-spectrum diagnostics (low-level)
+├── diag_uav_on_calibration.py   # S3 live UAV signal strength measurement (low-level)
+├── deploy_orangepi.sh           # One-shot Orange Pi 5 environment setup
+└── start_rf_vision.sh           # One-click system launch script
 ```
 
 ## 6. Deployment Instructions
@@ -118,17 +120,30 @@ python3 system_hub.py
 
 ### S3 Threshold Calibration (Recommended After Deployment)
 
-Before operating in a new RF environment, run the background diagnostics tool
-with the UAV **powered off** to measure the ambient NCC noise floor:
+After deploying in a new RF environment, run the one-click calibration wizard
+(completes in ~3 minutes):
 
 ```bash
-python3 diag_s3_false_positive.py
+python3 calibrate_s3.py
 ```
 
-If the measured background NCC exceeds 1%, adjust the S3 thresholds in
-`rf_zynq/rf_stage3_cyclostationary.py` as follows:
+The interactive wizard guides you through three phases:
 
 ```
-THRESHOLD_30K = max(0.028, 5 × NCC_bg_max_30k)
-THRESHOLD_15K = max(0.022, 5 × NCC_bg_max_15k)
+Phase 1 — Background Noise Baseline (UAV OFF)
+  → Automatically measures CAF-NCC ambient floor across all sectors
+
+Phase 2 — Live UAV Signal Measurement (UAV ON, optional)
+  → Measures real OcuSync signal strength to validate SNR margin
+
+Phase 3 — Threshold Derivation & Auto-Patch
+  → Calculates optimal THRESHOLD_30K / THRESHOLD_15K
+  → Automatically patches rf_zynq/rf_stage3_cyclostationary.py
+  → Saves calibration report plot (database/alert_images/)
+```
+
+Restart the system after calibration — new thresholds take effect immediately:
+
+```bash
+python3 system_hub.py
 ```
