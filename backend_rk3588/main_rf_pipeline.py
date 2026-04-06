@@ -30,7 +30,7 @@ PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJ_ROOT not in sys.path:
     sys.path.insert(0, PROJ_ROOT)
 
-import config as cfg
+from backend_rk3588 import config as cfg
 from rf_zynq.rf_stage1_rssi_scan import RF_Stage1_RSSIScan
 from rf_zynq.rf_stage2_waterfall_yolo import RF_Stage2_Dwell
 from rf_zynq.rf_stage3_cyclostationary import RF_Stage3_CycloAudit

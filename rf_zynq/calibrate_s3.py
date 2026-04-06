@@ -23,8 +23,8 @@ import re
 import time
 import numpy as np
 
-# ── 项目路径 ──────────────────────────────────────────────────────────────────
-_PROJ_ROOT = os.path.dirname(os.path.abspath(__file__))
+# ── 项目路径（本文件在 rf_zynq/ 内，根目录需向上两级）──────────────────────
+_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)
 
@@ -39,7 +39,6 @@ RX_GAIN     = 50
 BUFFER_SIZE = 2_621_440   # 65 ms @ 40 MSps
 SECTORS_HZ  = [5745e6, 5785e6, 5825e6]
 N_CAPTURES  = 6           # 每扇区采集段数（背景测量）
-N_CAPTURES_UAV = 8        # UAV-ON 采集段数
 
 # ── CAF 扫描参数（与 RF_Stage3_CycloAudit 完全一致）──────────────────────────
 CHUNK_SIZE       = 200_000
@@ -204,7 +203,7 @@ def _derive_thresholds(bg_results):
     return max(th30_candidates), max(th15_candidates)
 
 
-def phase3_apply(th_30k, th_15k):
+def phase2_apply(th_30k, th_15k):
     """
     将推导出的阈值自动写入 rf_stage3_cyclostationary.py。
     使用正则表达式精确替换阈值行，保留其余代码不变。
@@ -341,7 +340,7 @@ def main():
 
     ans = input("\n  确认写入 rf_stage3_cyclostationary.py？[Y/n] ").strip().lower()
     if ans in ('', 'y'):
-        phase3_apply(th_30k, th_15k)
+        phase2_apply(th_30k, th_15k)
         _save_report(bg_results, th_30k, th_15k)
         print("\n  ✓ 校准完成！重启 system_hub.py 后新阈值立即生效。")
     else:

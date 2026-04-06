@@ -96,8 +96,6 @@ RF-Vision-UAV-Tracker/
 │   ├── uav_tx_gui.py        # PlutoSDR 无人机射频靶机控制台（GUI）
 │   └── mock_k230.py         # PC 侧 K230 模拟器（MJPEG 流 + UDP 遥测）
 ├── calibrate_s3.py              # S3 一键现场校准向导（背景测量→阈值计算→自动写入）
-├── diag_s3_false_positive.py    # S3 环境背景噪声全谱诊断工具（底层）
-├── diag_uav_on_calibration.py   # S3 真机信号强度测量工具（底层）
 ├── deploy_orangepi.sh           # 香橙派 5 一键环境装配脚本
 └── start_rf_vision.sh           # 系统一键拉起脚本
 ```

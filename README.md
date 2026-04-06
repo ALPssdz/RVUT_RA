@@ -97,8 +97,6 @@ RF-Vision-UAV-Tracker/
 │   ├── uav_tx_gui.py        # PlutoSDR UAV RF target simulator GUI
 │   └── mock_k230.py         # PC-side K230 simulator (MJPEG + UDP)
 ├── calibrate_s3.py              # S3 one-click field calibration wizard
-├── diag_s3_false_positive.py    # S3 background noise full-spectrum diagnostics (low-level)
-├── diag_uav_on_calibration.py   # S3 live UAV signal strength measurement (low-level)
 ├── deploy_orangepi.sh           # One-shot Orange Pi 5 environment setup
 └── start_rf_vision.sh           # One-click system launch script
 ```

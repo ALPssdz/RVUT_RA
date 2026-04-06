@@ -15,7 +15,7 @@ from PyQt5.QtGui import QImage, QPixmap, QFont, QKeySequence
 from PyQt5.QtWidgets import QApplication, QShortcut
 from PyQt5.QtCore import QObject, pyqtSignal
 
-import config as cfg
+from backend_rk3588 import config as cfg
 from backend_rk3588.main_rf_pipeline import RFToolchain
 from vision_k230.k230_client import K230NetworkClient
 from ui_qt.gui_host import MainWindow
@@ -166,6 +166,15 @@ class CentralHubEngine(QObject):
         self.k230_client.stop()
 
 if __name__ == "__main__":
+    # ── 首次启动判断：如果用户需要现场重新校准阈值，在 GUI 拉起前先运行校准向导──
+    print("[RF-Vision] 启动检查：是否先运行 S3 CAF-FFT 阈值校准？")
+    print("            (建议首次就位或环境显著变化时运行，约 3 分钟)")
+    _ans = input("            [y/N] ≥ ").strip().lower()
+    if _ans == 'y':
+        from rf_zynq.calibrate_s3 import main as _calibrate
+        _calibrate()
+        print("[RF-Vision] 校准完成，正在启动主系统...\n")
+
     app = QApplication(sys.argv)
     hub = CentralHubEngine()
     hub.ui_window.showFullScreen()
