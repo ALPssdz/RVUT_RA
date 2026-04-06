@@ -237,7 +237,7 @@ class RFToolchain:
             alert_flag = True
             alert_info = {"freq_mhz": active_freq / 1e6, "score": audit_score}
             cv2.putText(annotated_frame, f"S3 LOCK  score={audit_score:.3f}",
-                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
             log_lines.append(
                 "<span style='color: #ff3333; font-weight: bold;'>"
                 "【最终判决】: 高置信度告警 — 检测到疑似无人机射频信号！"
