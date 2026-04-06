@@ -252,7 +252,7 @@ def phase2_apply(per_sector_th):
 # =============================================================================
 # Calibration report plot
 # =============================================================================
-def _save_report(bg_results, th_30k, th_15k):
+def _save_report(bg_results, per_sector_th):
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -267,6 +267,9 @@ def _save_report(bg_results, th_30k, th_15k):
 
         for ax, freq in zip(axes, SECTORS_HZ):
             bg = bg_results.get(freq, {})
+            th = per_sector_th.get(freq, {'th_30k': HARD_FLOOR_30K, 'th_15k': HARD_FLOOR_15K})
+            th_30k = th['th_30k']
+            th_15k = th['th_15k']
             values = [
                 bg.get('ncc_30k_max', 0) * 100,
                 bg.get('ncc_15k_max', 0) * 100,
@@ -298,8 +301,7 @@ def _save_report(bg_results, th_30k, th_15k):
         from datetime import datetime
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         fig.suptitle(
-            f'S3 CAF-FFT Calibration Report | '
-            f'TH_30K={th_30k*100:.2f}%  TH_15K={th_15k*100:.2f}%',
+            f'S3 CAF-FFT Calibration Report  (NOISE_MARGIN={NOISE_MARGIN}x)',
             fontsize=12, fontweight='bold'
         )
         plt.tight_layout()
@@ -331,13 +333,14 @@ def main():
     # Phase 2: derive per-sector thresholds
     per_sector_th = _derive_thresholds(bg_results)
 
-    print(f"\n  +{'':'-<46}+")
-    print(f"  | Per-sector derived thresholds (NOISE_MARGIN={NOISE_MARGIN}x){'':4}|")
+    print("\n  +" + "-" * 46 + "+")
+    print(f"  | Per-sector derived thresholds  (NOISE_MARGIN = {NOISE_MARGIN}x)   |")
     for freq, th in per_sector_th.items():
-        print(f"  |  {freq/1e6:.0f} MHz:  "
-              f"TH_30k={th['th_30k']*100:5.2f}%   "
-              f"TH_15k={th['th_15k']*100:5.2f}%{'':10}|")
-    print(f"  +{'':'-<46}+")
+        line = (f"  |  {freq/1e6:.0f} MHz:  "
+                f"TH_30k={th['th_30k']*100:5.2f}%   "
+                f"TH_15k={th['th_15k']*100:5.2f}%")
+        print(line.ljust(48) + "|")
+    print("  +" + "-" * 46 + "+")
 
     # Auto-write
     phase2_apply(per_sector_th)
