@@ -1,259 +1,478 @@
+# -*- coding: utf-8 -*-
+"""
+rf_stage3_cyclostationary.py — Stage 3: Cyclic Frequency Discriminator (CFD v3.0)
+===================================================================================
+
+算法核心升级：从 α=0 标准自相关 → CAF-FFT 循环频率判别器
+===========================================================
+
+【旧算法局限】
+  R_x^0(τ) = E[x(t) · x*(t-τ)]
+  ↳ 仅在时延域区分协议，当 WiFi 功率 >> UAV 时，τ=128(WiFi) 处能量溢出到
+    τ=1333/2667(OcuSync) 导致虚警，同时也掩盖微弱 OcuSync 信号。
+
+【新算法原理：循环自相关函数 CAF】
+  R_x^α(τ) = (1/N) Σ x[n]·x*[n-τ]·exp(-j2π α n/Fs)
+
+  其中 α 称为"循环频率"，对应信号的周期性循环速率：
+    · OcuSync 30kHz：  α₀ = Fs/(N_fft + N_cp) ≈ 24 kHz  （τ = 1333,  CP=1/4）
+    · OcuSync 15kHz：  α₀ =  Fs/(N_fft + N_cp) ≈ 12 kHz  （τ = 2667,  CP=1/4）
+    · IEEE 802.11 WiFi：α₀ = 1/T_sym = 250 kHz             （τ = 128）
+
+  各协议循环频率完全分离。当以 OcuSync 的 α₀ 解调时，WiFi 的贡献为：
+    NCC_WiFi(α_OcuSync, τ) ≈ A_WiFi · sinc((α_WiFi - α_OcuSync) · N / Fs)
+                            ≈ A_WiFi · sinc(226kHz × 200000 / 40MHz)
+                            ≈ A_WiFi · sinc(1130) ≈ 0.028%
+
+  即使 WiFi 比无人机信号强 20 dB（10×），其在 OcuSync 循环频率通道上的泄漏
+  仍为 0.028%，远低于 OcuSync 信号本身的 NCC（典型值 5~25%）。
+
+【实现方式：FFT 加速 α 扫描】
+  对于每帧、每个目标时延 τ，仅需：
+    1. z[n] = x[n] · x*[n-τ]           # 时延乘积序列，O(N)
+    2. Z[k] = FFT(z)                    # 一次 FFT 覆盖所有 α，O(N log N)
+    3. NCC[α] = |Z[k]| / (N · P_x)     # 提取 OcuSync α-范围内最大值，O(1)
+
+  相比逐点扫描大幅降低计算量，同时完整保留 α 域分辨率。
+
+目标延迟（Fs = 40 MSps）：
+  · τ=1333 → N_fft = Fs/30kHz → OcuSync 3.0/4.0 (Mini 4 Pro, Mavic 3)
+  · τ=2667 → N_fft = Fs/15kHz → OcuSync 2.0     (Mini 3, Air 2S)
+
+OcuSync α 扫描范围（覆盖 CP 比例 1/8 ~ 1/3 的全部情形）：
+  · OcuSync 30kHz: α ∈ [18 kHz, 32 kHz]
+  · OcuSync 15kHz: α ∈ [ 9 kHz, 16 kHz]
+"""
+
 import numpy as np
 from datetime import datetime
 
+
 class RF_Stage3_CycloAudit:
     """
-    Stage 3: OcuSync Cyclostationary Spectral Audit Module
+    Stage 3 v3.0 — CAF-FFT 循环频率判别器
 
-    基于循环平稳信号分析理论（Cyclostationary Signal Analysis），
-    对 Stage 2 采集的原始 IQ 数据进行 OFDM 循环前缀（Cyclic Prefix, CP）
-    时移自相关检测，以提取 DJI OcuSync 协议的物理层周期性特征。
-
-    检测原理：
-      OFDM 信号具有循环平稳性。其循环前缀长度为 T_cp，对应延迟 Tau = T_cp × Fs 个样本。
-      时移自相关函数 R(τ) = E[x*(t) · x(t+τ)] 在 τ = T_cp 处呈现显著峰值。
-      归一化后的峰值强度反映了该延迟对应协议的能量占比，可用于协议指纹识别。
-
-    目标延迟参数（Fs = 40 MSps）：
-      - IEEE 802.11 (Wi-Fi): 子载波间隔 Δf = 312.5 kHz → T_u = 3.2 μs → τ_wifi = 128 samples
-      - OcuSync 2.0 (15 kHz): Δf = 15 kHz → T_u = 66.67 μs → τ_15k = 2667 samples
-      - OcuSync 3.0/4.0 (30 kHz): Δf = 30 kHz → T_u = 33.33 μs → τ_30k = 1333 samples
-
-    虚警抑制机制：
-      1. 功率门控：接收功率低于 MIN_POWER_GATE 时跳过（防止低 SNR 下归一化失真）
-      2. 双通道独立判决：τ_30k 和 τ_15k 各自独立与对应阈值比较，避免通道间阈值混用
-      3. 电源纹波鉴别：真实 OcuSync CP 峰在时延域呈 Delta 冲激，旁开 5 samples 即衰减至噪声底；
-         DC-DC SMPS 纹波为低频连续正弦，旁开后仍保持高相关性，据此区分两者
-      4. Wi-Fi 自适应阈值：当 τ_128 处得分较高时，动态上调检测阈值，防止 Wi-Fi 溢出误触发
+    公开接口与 v2.x 完全兼容：
+        run_spectral_audit(iq_data_buffer) → (bool, float)
     """
 
-    def __init__(self, sample_rate=40e6):
-        self.sample_rate = sample_rate
+    # ─── 协议物理参数 ────────────────────────────────────────────────────────
+    TAU_OCUSYNC_30K = 1333   # OcuSync 3.0/4.0  N_fft = 40MHz/30kHz
+    TAU_OCUSYNC_15K = 2667   # OcuSync 2.0       N_fft = 40MHz/15kHz
+    TAU_WIFI        = 128    # IEEE 802.11        N_fft = 40MHz/312.5kHz
 
-        # 各协议的循环前缀时延样本数（基于 OFDM 子载波间隔计算）
-        # τ = round(Fs / Δf)，其中 Δf 为子载波间隔频率
-        self.delay_wifi_cp     = 128   # IEEE 802.11 a/g/n/ac, Δf = 312.5 kHz
-        self.delay_ocusync_15k = 2667  # OcuSync 2.0 (DJI Mini 3/Air 2S), Δf = 15 kHz
-        self.delay_ocusync_30k = 1333  # OcuSync 3.0/4.0 (DJI Mini 4 Pro/Mavic 3), Δf = 30 kHz
+    # OcuSync 循环频率扫描范围（Hz），覆盖 CP_ratio ∈ [1/8, 1/3]
+    # α_sym = Fs / (N_fft + N_cp) = Fs / (N_fft · (1 + CP_ratio))
+    #   CP=1/8 → α = 40MHz/(1333·1.125) = 26.7 kHz (30k 通道)
+    #   CP=1/3 → α = 40MHz/(1333·1.333) = 22.5 kHz
+    ALPHA_SCAN_30K = (18_000.0, 32_000.0)   # 扫描窗口略宽，余量 ±2kHz
+    ALPHA_SCAN_15K = ( 9_000.0, 16_000.0)
 
-    # =========================================================================
-    # 检测阈值（基于现场环境实测背景数据校准，v3.0）
-    #
-    # 测试环境：室内 5.8GHz ISM 频段，无人机关机状态，采集 3 组背景数据取最大值：
-    #   τ=1333 背景峰值：3.29%（5745 MHz 扇区）
-    #   τ=2667 背景峰值：2.98%（5825 MHz 扇区）
-    #
-    # 阈值设定准则：γ = β_bg_max × α_margin
-    #   其中 α_margin = 2.0（安全余量因子，确保虚警概率 Pfa ≪ 1 同时保留足够检测余量）
-    #   THRESHOLD_30K = 3.29% × 2.0 = 6.6% → 取 7%（工程上调整）
-    #   THRESHOLD_15K = 2.98% × 2.0 = 5.96% → 取 6%
-    # =========================================================================
-    THRESHOLD_30K = 0.07  # τ=1333 通道检测阈值（OcuSync 30 kHz 子载波，Mini 4 Pro）
-    THRESHOLD_15K = 0.06  # τ=2667 通道检测阈值（OcuSync 15 kHz 子载波，Mini 3）
+    # WiFi 监控循环频率（仅用于日志输出，不参与判决）
+    ALPHA_WIFI_HZ  = 250_000.0
 
-    # 最低可信信号功率门控阈值（归一化 IQ 功率）
-    # 依据：5.8 GHz 相较 2.4 GHz 自由空间路径损耗增量：
-    #   ΔL = 20·log₁₀(5800/2450) = +7.5 dB，即接收功率下降约 5.6 倍
-    # 实测 5785 MHz 扇区背景功率约 6.6×10⁻⁵，将门控阈值设为 1×10⁻⁵
-    # 低于此功率时，SNR 不足以支撑可信的归一化相关估计，直接返回 0
+    # ─── 决策阈值 ────────────────────────────────────────────────────────────
+    # CAF-NCC 噪声底理论值：≈ 1/√N = 1/√200000 ≈ 0.22%
+    # 保守设定为噪声底的 10~12 倍（Pfa << 0.1%），同时兼顾弱信号灵敏度
+    THRESHOLD_30K = 0.028   # 2.8%（原 7%；WiFi 已被循环频率正交性抑制）
+    THRESHOLD_15K = 0.022   # 2.2%（原 6%）
+
+    # 联合统计量权重：peak_weight × 峰值 + (1 - peak_weight) × 帧均值
+    # 较高的均值权重使持续弱信号有更多帧叠加 SNR 增益
+    PEAK_WEIGHT = 0.45
+
+    # τ 域峰值旁瓣比（PSR）阈值
+    # OFDM CP 峰为 Delta 冲激，PSR >> 1；SMPS/宽带干扰 PSR ≈ 1
+    PSR_THRESHOLD      = 2.5   # 普通环境
+    PSR_THRESHOLD_WIFI = 3.2   # 强 WiFi 监控区上调
+
+    # α 域循环频率集中度（Cyclic Frequency Sharpness, CFS）阈值
+    # 真实 OcuSync：α 峰尖锐（CFS > CFS_TH）；宽带干扰：α 峰平坦（CFS < CFS_TH）
+    CFS_THRESHOLD = 1.8
+
+    # 功率门控（与 v2.x 保持一致）
     MIN_POWER_GATE = 1e-5
 
-    # -------------------------------------------------------------------------
-    def _compute_cp_correlation(self, complex_iq, delay_samples):
+    # ─── 帧分析参数 ──────────────────────────────────────────────────────────
+    CHUNK_SIZE = 200_000
+    OVERLAP    = 0.50          # 50% 帧重叠，确保帧边界处的突发包不被漏检
+
+    def __init__(self, sample_rate: float = 40e6):
+        self.sample_rate = float(sample_rate)
+        self._freq_res   = None   # 将在首次 run_spectral_audit 按实际 chunk 设置
+
+    # =========================================================================
+    # 内核：CAF-FFT 计算
+    # =========================================================================
+    def _prepare_chunk(self, raw_chunk) -> tuple:
         """
-        计算归一化时移自相关系数（Normalized Delayed Autocorrelation）。
-
-        定义：
-            R(τ) = |E[x*(t) · x(t+τ)]| / E[|x(t+τ)|²]
-
-        其中 τ = delay_samples，x(t) 为基带复包络 IQ 序列。
-        对 OFDM 信号，R(τ = T_cp·Fs) 处出现显著峰值，
-        峰值幅度反映循环前缀能量占总信号功率的比例。
+        共用预处理：归一化 + DC 去除 + 功率计算。
 
         Returns
         -------
-        float : 归一化自相关系数（0~1），0 表示无周期性特征或功率不足
+        (x, power) : x 为 complex64 基带序列，power 为归一化均值功率。
+                     若功率不足（低 SNR），返回 (None, 0.0)。
         """
-        # 归一化至 [-1, 1] 量程，去除 ADC 整数量化偏置
-        normalized_iq = complex_iq / 32768.0
+        x = raw_chunk.astype(np.complex64) / 32768.0
+        x -= x.mean()
+        power = float(np.mean(np.abs(x) ** 2))
+        if power < self.MIN_POWER_GATE:
+            return None, 0.0
+        return x, power
 
-        # 去除直流失调（DC Offset）与本振泄漏（LO Leakage）
-        normalized_iq = normalized_iq - np.mean(normalized_iq)
-
-        if len(normalized_iq) <= delay_samples:
-            return 0.0
-
-        iq_main    = normalized_iq[delay_samples:]
-        iq_delayed = normalized_iq[:-delay_samples]
-
-        power_main = np.mean(np.abs(iq_main) ** 2)
-
-        # 功率门控：接收功率低于阈值时，归一化结果由热噪声涨落主导，不可信
-        if power_main < self.MIN_POWER_GATE:
-            return 0.0
-
-        # 计算复互相关并归一化
-        correlation = np.abs(np.mean(iq_main * np.conj(iq_delayed)))
-        return correlation / (power_main + 1e-12)
-
-    # -------------------------------------------------------------------------
-    def run_spectral_audit(self, iq_data_buffer):
+    def _compute_caf_spectrum(self, x: np.ndarray, tau: int, power: float) -> np.ndarray:
         """
-        对输入 IQ 缓冲区执行完整的循环谱审计流程。
+        计算归一化循环自相关谱（Normalized CAF Spectrum）。
 
-        算法流程：
-          1. 滑动窗口分帧（窗口长度 200 000 采样点，50% 重叠）
-          2. 对每帧并行计算 τ_30k 和 τ_15k 的归一化自相关系数
-          3. 记录各通道在全缓冲区内的峰值（peak_30k, peak_15k）
-          4. 分别与对应阈值（动态调整后）进行独立比较，任一超标进入验证流程
-          5. 旁开点验证：计算 τ-5 处的相关值，判断时延峰的尖锐度
-             - 峰值尖锐（adj/peak < 0.6）：与 OFDM CP 特征一致 → 判定为 OcuSync
-             - 峰值宽平（adj/peak ≥ 0.6）：与连续波纹波特征一致 → 判定为 SMPS 干扰
+        原理：
+          z[n] = x[n] · x*[n-τ]  （时延 τ 的乘积序列）
+          Z[k] = FFT(z)           （其频谱 = 循环自相关函数在 α 轴上的分布）
+          NCC[α] = |Z[k]| / (N_z · P_x)
+
+        当 α 等于信号真实循环频率 α₀ = 1/T_sym 时，NCC 取峰值（≈ CP 比例）；
+        当 α ≠ α₀ 时，NCC ≈ 1/√N（噪声底）。
+
+        Parameters
+        ----------
+        x     : 归一化 IQ 序列（已去 DC）
+        tau   : 目标时延（样本数）
+        power : x 的均值功率（用于归一化）
+
+        Returns
+        -------
+        ncc_spectrum : 归一化 CAF 幅度谱，长度 = len(x) - tau，频率分辨率 = Fs/N
+        """
+        if len(x) <= tau:
+            return np.zeros(1)
+
+        z   = x[tau:] * np.conj(x[:-tau])
+        N_z = len(z)
+        Z   = np.fft.fft(z.astype(np.complex64))
+        # 归一化：除以 N_z（窗口长度）和功率，得到无量纲相干系数
+        return np.abs(Z) / (N_z * (power + 1e-12))
+
+    def _extract_ncc_in_range(
+        self,
+        ncc_spectrum: np.ndarray,
+        chunk_len: int,
+        alpha_range_hz: tuple,
+    ) -> tuple:
+        """
+        从 CAF 谱中提取指定 α 范围内的峰值。
+
+        Parameters
+        ----------
+        ncc_spectrum   : _compute_caf_spectrum 返回的归一化谱
+        chunk_len      : 原始 chunk 长度（用于 bin 计算）
+        alpha_range_hz : (alpha_lo_hz, alpha_hi_hz)
+
+        Returns
+        -------
+        (peak_ncc, best_alpha_hz, cfs)
+          peak_ncc     : 范围内最大 NCC 值
+          best_alpha_hz: 对应的最佳循环频率（Hz）
+          cfs          : 循环频率集中度 = peak / median(其余 bin in range)
+        """
+        N     = len(ncc_spectrum)
+        f_res = self.sample_rate / N          # Hz / bin
+
+        k_lo = max(1, int(np.round(alpha_range_hz[0] / f_res)))
+        k_hi = min(N // 2, int(np.round(alpha_range_hz[1] / f_res)) + 1)
+
+        if k_lo >= k_hi:
+            return 0.0, alpha_range_hz[0], 1.0
+
+        segment    = ncc_spectrum[k_lo:k_hi]
+        peak_idx   = int(np.argmax(segment))
+        peak_ncc   = float(segment[peak_idx])
+        best_alpha = (k_lo + peak_idx) * f_res
+
+        # 循环频率集中度（CFS）：峰值 / 旁瓣中值
+        sidelobes = np.delete(segment, peak_idx)
+        cfs = peak_ncc / (float(np.median(sidelobes)) + 1e-12) if len(sidelobes) else 1.0
+
+        return peak_ncc, best_alpha, cfs
+
+    def _compute_psr(
+        self,
+        x: np.ndarray,
+        power: float,
+        tau_target: int,
+        alpha_best_hz: float,
+        delta_guard: int = 25,
+        n_side: int = 10,
+        half_w: int = 200,
+    ) -> float:
+        """
+        τ 域峰值旁瓣比（PSR）。
+
+        PSR(τ_0) = NCC(α_best, τ_0) / median{ NCC(α_best, τ) : |τ-τ_0| > δ_guard }
+
+        真实 OFDM CP 峰（Delta 冲激型）：PSR >> 1
+        SMPS 开关纹波 / 宽带干扰（连续型）：PSR ≈ 1
+
+        使用已知最佳 α 在旁瓣 τ 点上重新计算单点 CAF，无需再做 FFT。
+        """
+        def single_caf(tau_probe: int) -> float:
+            if len(x) <= tau_probe:
+                return 0.0
+            z  = x[tau_probe:] * np.conj(x[:-tau_probe])
+            pw = float(np.mean(np.abs(x[tau_probe:]) ** 2))
+            if pw < self.MIN_POWER_GATE:
+                return 0.0
+            n      = np.arange(len(z), dtype=np.float32)
+            demod  = np.exp(-1j * 2.0 * np.pi * alpha_best_hz / self.sample_rate * n)
+            return float(np.abs(np.mean(z * demod))) / (pw + 1e-12)
+
+        peak = single_caf(tau_target)
+
+        # 构造旁瓣采样点（保护带外均匀分布）
+        lo = max(delta_guard + 20, tau_target - half_w)
+        hi = min(len(x) // 3,     tau_target + half_w)
+        candidates = [
+            int(t) for t in np.linspace(lo, hi, n_side * 3)
+            if abs(int(t) - tau_target) > delta_guard
+        ][:n_side]
+
+        if not candidates:
+            return 1.0
+
+        sidelobes = [single_caf(t) for t in candidates]
+        median_sl = float(np.median(sidelobes))
+        return peak / (median_sl + 1e-12)
+
+    # =========================================================================
+    # 公开接口
+    # =========================================================================
+    def run_spectral_audit(self, iq_data_buffer) -> tuple:
+        """
+        对输入 IQ 缓冲区执行完整的 CAF-FFT 循环频率审计。
+
+        检测流程（四级漏斗）：
+          Level 1  帧级 CAF 扫描 → 每帧提取 OcuSync 30k/15k 两通道 NCC 峰值
+          Level 2  联合统计判决 → combined = α·peak + (1-α)·avg > 动态阈值
+          Level 3  τ 域 PSR 验证 → 峰值旁瓣比确认 CP Delta 冲激特征
+          Level 4  α 域 CFS 验证 → 循环频率集中度排除宽频扰动（可选加严）
+
+        WiFi 干扰抑制原理（无需任何启发式规则）：
+          IEEE 802.11 的循环频率为 250 kHz，在 OcuSync 的 18~32 kHz 扫描窗口
+          之外，CAF 正交性使其泄漏幅度 ≈ 0.028%（即使 WiFi 强 20 dB 也无碍）。
 
         Parameters
         ----------
         iq_data_buffer : array-like
-            来自 AD9364 ADC 的原始整数 IQ 数据（int16 格式，I/Q 交织或复数数组）
+            AD9364 ADC 原始整数 IQ 数据（int16，复数或交织格式均可）
 
         Returns
         -------
-        (bool, float) : (检测结果, 最大相关系数)
-            True 表示检测到 OcuSync 协议特征，False 表示未检测到或被虚警抑制
+        (bool, float) : (检测结果, 最大 NCC 系数)
         """
-        chunk_size   = 200000
-        step_size    = chunk_size // 2  # 50% 重叠，保证帧边界处的突发包不被漏检
-        total_samples = len(iq_data_buffer)
+        buf           = np.asarray(iq_data_buffer)
+        total_samples = len(buf)
+        step_size     = int(self.CHUNK_SIZE * (1.0 - self.OVERLAP))
 
-        # 第一遍扫描：追踪全局最大值（用于确定最佳候选帧及 Wi-Fi 伴随指标）
-        max_30k      = 0.0
-        assoc_wifi_cp = 0.0
-        best_chunk   = None
-        target_delay = self.delay_ocusync_30k
+        # ── Level 1：逐帧 CAF-FFT 扫描 ─────────────────────────────────────
+        frames_30k: list[tuple] = []   # (peak_ncc, best_alpha, cfs)
+        frames_15k: list[tuple] = []
+        chunks_by_frame: list   = []
 
-        for i in range(0, total_samples - chunk_size, step_size):
-            chunk = iq_data_buffer[i : i + chunk_size]
-            score_cp_30k = self._compute_cp_correlation(chunk, self.delay_ocusync_30k)
-            score_cp_15k = self._compute_cp_correlation(chunk, self.delay_ocusync_15k)
-            local_max = max(score_cp_30k, score_cp_15k)
+        for i in range(0, total_samples - self.CHUNK_SIZE, step_size):
+            chunk = buf[i : i + self.CHUNK_SIZE]
+            x, pwr = self._prepare_chunk(chunk)
+            if x is None:
+                continue
 
-            # 记录含最高 OcuSync 特征的候选帧，同步提取其 Wi-Fi 伴随相关系数
-            if local_max > max_30k:
-                max_30k       = local_max
-                assoc_wifi_cp = self._compute_cp_correlation(chunk, self.delay_wifi_cp)
-                best_chunk    = chunk
-                target_delay  = self.delay_ocusync_30k if score_cp_30k > score_cp_15k else self.delay_ocusync_15k
+            # OcuSync 30kHz 通道
+            spec_30k = self._compute_caf_spectrum(x, self.TAU_OCUSYNC_30K, pwr)
+            ncc_30k, alpha_30k, cfs_30k = self._extract_ncc_in_range(
+                spec_30k, self.CHUNK_SIZE, self.ALPHA_SCAN_30K
+            )
 
-        print(f"  [S3] Background correlation — R(τ=128)={assoc_wifi_cp*100:.1f}% | OcuSync max peak: {max_30k*100:.2f}%")
+            # OcuSync 15kHz 通道
+            spec_15k = self._compute_caf_spectrum(x, self.TAU_OCUSYNC_15K, pwr)
+            ncc_15k, alpha_15k, cfs_15k = self._extract_ncc_in_range(
+                spec_15k, self.CHUNK_SIZE, self.ALPHA_SCAN_15K
+            )
 
-        # =====================================================================
-        # 双通道独立判决（Independent Dual-Channel Decision）
-        #
-        # 设计依据：τ_30k 与 τ_15k 分别对应不同型号无人机的协议规格，
-        # 信号强度存在差异，不应共用同一阈值进行首级门限判断。
-        # 采用各通道独立与其对应阈值比较，OR 逻辑触发后验证，可提升检测概率。
-        # =====================================================================
-        th_30k = self.THRESHOLD_30K
-        th_15k = self.THRESHOLD_15K
+            frames_30k.append((ncc_30k, alpha_30k, cfs_30k))
+            frames_15k.append((ncc_15k, alpha_15k, cfs_15k))
+            chunks_by_frame.append(x)
 
-        # Wi-Fi 自适应阈值调整：
-        # 当 τ_128 处相关系数较高时，表明环境中存在强 Wi-Fi 干扰，
-        # 动态上调阈值以抑制 Wi-Fi 频谱溢出（spectral spillover）导致的虚警
-        dynamic_th_30k = max(th_30k, assoc_wifi_cp * 0.40)
-        dynamic_th_15k = max(th_15k, assoc_wifi_cp * 0.40)
+        if not frames_30k:
+            print("  [S3-v3] 警告：有效帧为 0（全部功率低于门控阈值）")
+            return False, 0.0
 
-        # 第二遍扫描：各通道独立追踪峰值（避免通道间最大值互相掩盖）
-        peak_30k = 0.0
-        peak_15k = 0.0
-        for i in range(0, total_samples - chunk_size, step_size):
-            chunk = iq_data_buffer[i : i + chunk_size]
-            s30 = self._compute_cp_correlation(chunk, self.delay_ocusync_30k)
-            s15 = self._compute_cp_correlation(chunk, self.delay_ocusync_15k)
-            if s30 > peak_30k:
-                peak_30k     = s30
-                target_delay = self.delay_ocusync_30k
-            if s15 > peak_15k:
-                peak_15k     = s15
-                best_chunk   = chunk
-                target_delay = self.delay_ocusync_15k
+        arr_30k = np.array([f[0] for f in frames_30k])
+        arr_15k = np.array([f[0] for f in frames_15k])
 
-        print(f"  [S3] Dual-channel peaks — τ=1333: {peak_30k*100:.2f}% (th={dynamic_th_30k*100:.1f}%) | "
-              f"τ=2667: {peak_15k*100:.2f}% (th={dynamic_th_15k*100:.1f}%)")
+        peak_30k = float(arr_30k.max())
+        peak_15k = float(arr_15k.max())
+        avg_30k  = float(arr_30k.mean())
+        avg_15k  = float(arr_15k.mean())
 
-        # OR 逻辑：任一通道超过其对应阈值，即进入验证阶段
-        triggered       = False
+        # 联合统计量：兼顾突发峰值（高 peak_weight）与持续弱信号（高 avg 权重）
+        combined_30k = self.PEAK_WEIGHT * peak_30k + (1.0 - self.PEAK_WEIGHT) * avg_30k
+        combined_15k = self.PEAK_WEIGHT * peak_15k + (1.0 - self.PEAK_WEIGHT) * avg_15k
+
+        # WiFi 通道监控（仅日志，不参与判决）
+        best_frame_x = chunks_by_frame[int(arr_30k.argmax())]
+        _, pwr_best  = self._prepare_chunk(best_frame_x)   # 再次归一化，保持一致
+        wifi_ncc = 0.0
+        if pwr_best and pwr_best > self.MIN_POWER_GATE:
+            spec_wifi = self._compute_caf_spectrum(best_frame_x, self.TAU_WIFI, pwr_best)
+            k_wifi = max(1, int(np.round(self.ALPHA_WIFI_HZ / (self.sample_rate / len(spec_wifi)))))
+            k_wifi = min(k_wifi, len(spec_wifi) - 1)
+            wifi_ncc = float(spec_wifi[k_wifi])
+
+        print(
+            f"  [S3-v3] {len(frames_30k)} frames | "
+            f"OcuSync30k: peak={peak_30k*100:.2f}% avg={avg_30k*100:.2f}% "
+            f"→ combined={combined_30k*100:.2f}% (th={self.THRESHOLD_30K*100:.1f}%) | "
+            f"OcuSync15k: peak={peak_15k*100:.2f}% avg={avg_15k*100:.2f}% "
+            f"→ combined={combined_15k*100:.2f}% (th={self.THRESHOLD_15K*100:.1f}%) | "
+            f"WiFi@250kHz(监控)={wifi_ncc*100:.2f}%"
+        )
+
+        # ── Level 2：联合统计量一级门限 ────────────────────────────────────
+        triggered_ch  = None    # '30k' 或 '15k'
         triggered_score = 0.0
-        if peak_30k > dynamic_th_30k:
-            triggered       = True
-            triggered_score = max(triggered_score, peak_30k)
-        if peak_15k > dynamic_th_15k:
-            triggered       = True
-            triggered_score = max(triggered_score, peak_15k)
 
-        if triggered:
-            # =================================================================
-            # 时延旁瓣验证（Adjacent-Tap Sharpness Test）
-            #
-            # 原理：真实 OFDM 循环前缀的时移自相关在 τ = T_cp 处呈现 Delta 函数特征，
-            # 偏移 ±5 个采样点后，相关值应迅速衰减至背景噪声水平（< 1%）。
-            # DC-DC SMPS 的开关纹波为低频连续正弦波，其自相关函数为正弦包络，
-            # 旁开 5 点后相关值衰减有限（> 60% 峰值），可据此区分两种干扰源。
-            # =================================================================
-            if best_chunk is not None:
-                adj_corr = self._compute_cp_correlation(best_chunk, target_delay - 5)
-                if adj_corr > (triggered_score * 0.60):
-                    print(f"  [S3] Adjacent-tap test FAILED: R(τ-5)={adj_corr*100:.1f}% > "
-                          f"0.60 × peak({triggered_score*100:.1f}%) — SMPS ripple interference, alert suppressed.")
-                    return False, triggered_score
+        if combined_30k >= self.THRESHOLD_30K:
+            if combined_30k >= combined_15k or combined_15k < self.THRESHOLD_15K:
+                triggered_ch    = '30k'
+                triggered_score = combined_30k
+            else:
+                triggered_ch    = '15k'
+                triggered_score = combined_15k
+        elif combined_15k >= self.THRESHOLD_15K:
+            triggered_ch    = '15k'
+            triggered_score = combined_15k
 
-                # 检测确认：生成循环谱诊断图像（用于事后分析）
-                try:
-                    import matplotlib
-                    matplotlib.use('Agg')
-                    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
-                    matplotlib.rcParams['axes.unicode_minus'] = False
-                    import matplotlib.pyplot as plt
-                    import os
+        if triggered_ch is None:
+            print("  [S3-v3] 未超过检测阈值 — 无人机未检测到。")
+            return False, max(combined_30k, combined_15k)
 
-                    print("  [S3] Generating cyclostationary spectrum snapshot...")
-                    delays_scan = np.arange(100, 3000, 10)
-                    corrs_scan  = [self._compute_cp_correlation(best_chunk, d) for d in delays_scan]
+        # 取触发通道的最强帧和对应参数
+        if triggered_ch == '30k':
+            best_idx     = int(arr_30k.argmax())
+            tau_t        = self.TAU_OCUSYNC_30K
+            alpha_best   = frames_30k[best_idx][1]
+            cfs_best     = frames_30k[best_idx][2]
+            label        = "OcuSync 30kHz (Mini 4 Pro / Mavic 3)"
+        else:
+            best_idx     = int(arr_15k.argmax())
+            tau_t        = self.TAU_OCUSYNC_15K
+            alpha_best   = frames_15k[best_idx][1]
+            cfs_best     = frames_15k[best_idx][2]
+            label        = "OcuSync 15kHz (Mini 3 / Air 2S)"
 
-                    plt.figure(figsize=(10, 4))
-                    plt.plot(delays_scan, corrs_scan, color='#FF5722', linewidth=1.2,
-                             label='Normalized Autocorrelation')
-                    plt.axvline(1333, color='#1565C0', linestyle='--',
-                                label=f'τ=1333 (OcuSync 30kHz): {peak_30k*100:.1f}%')
-                    plt.axvline(2667, color='#2E7D32', linestyle='--',
-                                label=f'τ=2667 (OcuSync 15kHz): {peak_15k*100:.1f}%')
-                    plt.axhline(dynamic_th_30k, color='#1565C0', linestyle=':', alpha=0.6,
-                                label=f'Threshold 30k = {dynamic_th_30k*100:.1f}%')
-                    plt.axhline(dynamic_th_15k, color='#2E7D32', linestyle=':', alpha=0.6,
-                                label=f'Threshold 15k = {dynamic_th_15k*100:.1f}%')
-                    plt.title(f"S3 Cyclostationary Audit — OcuSync Detected "
-                              f"(τ₃₀: {peak_30k*100:.2f}% | τ₁₅: {peak_15k*100:.2f}%)")
-                    plt.xlabel("Delay τ (samples)  [Fs = 40 MSps]")
-                    plt.ylabel("Normalized Autocorrelation Coefficient")
-                    plt.grid(alpha=0.3)
-                    plt.legend(fontsize=8)
-                    plt.tight_layout()
+        best_x = chunks_by_frame[best_idx]
+        _, pwr_best = self._prepare_chunk(best_x)
+        if pwr_best is None:
+            pwr_best = self.MIN_POWER_GATE
 
-                    db_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "..", "database", "alert_images")
-                    os.makedirs(db_dir, exist_ok=True)
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    snap_path = os.path.join(db_dir, f"S3_Cyclo_{ts}.png")
-                    plt.savefig(snap_path, dpi=120)
-                    plt.close()
-                    print(f"  [S3] Snapshot saved → {snap_path}")
-                except Exception as e:
-                    print(f"  [S3] Snapshot generation error: {e}")
+        # ── Level 3：τ 域 PSR 验证 ──────────────────────────────────────────
+        # 根据 WiFi 监控值动态调整 PSR 要求：
+        # wifi_ncc > 0.01 说明 250kHz 通道有能量（WiFi 存在），但不代表 OcuSync 误报，
+        # 仅作为上调 PSR 严格程度的依据。
+        psr_th = self.PSR_THRESHOLD_WIFI if wifi_ncc > 0.010 else self.PSR_THRESHOLD
+        psr    = self._compute_psr(best_x, pwr_best, tau_t, alpha_best)
 
-            return True, triggered_score
+        print(
+            f"  [S3-v3] PSR 验证: τ={tau_t}, α_best={alpha_best/1e3:.1f}kHz, "
+            f"PSR={psr:.2f}x (th={psr_th:.1f}x), CFS={cfs_best:.2f}x (th={self.CFS_THRESHOLD:.1f}x)"
+        )
 
-        # Wi-Fi 高强度拦截日志
-        elif assoc_wifi_cp > 0.040:
-            print(f"  [S3] Wi-Fi spillover suppression: R(τ=128)={assoc_wifi_cp*100:.1f}% > 4.0% "
-                  f"— classified as IEEE 802.11 spectral spillover, alert suppressed.")
-            return False, assoc_wifi_cp
+        if psr < psr_th:
+            print(
+                f"  [S3-v3] PSR 验证失败 ({psr:.2f}x < {psr_th:.1f}x) — "
+                f"时延峰宽平，判定为宽带干扰/SMPS，告警抑制。"
+            )
+            return False, triggered_score
 
-        return False, max_30k
+        # ── Level 4：α 域 CFS 验证（循环频率集中度）────────────────────────
+        # 真实 OcuSync：循环频率高度集中在特定 α 处（CFS >> 1）
+        # 宽带干扰（如杂散谐波）：CAF 谱平坦（CFS ≈ 1）
+        if cfs_best < self.CFS_THRESHOLD:
+            print(
+                f"  [S3-v3] CFS 验证失败 ({cfs_best:.2f}x < {self.CFS_THRESHOLD:.1f}x) — "
+                f"循环频率分散，非 OcuSync 特征，告警抑制。"
+            )
+            return False, triggered_score
+
+        # ── 通过全部验证：生成诊断快照 ─────────────────────────────────────
+        print(f"  [S3-v3] ✓ 检测确认：{label}")
+        print(f"           NCC={triggered_score*100:.2f}%  α_best={alpha_best/1e3:.2f}kHz  "
+              f"PSR={psr:.1f}x  CFS={cfs_best:.1f}x")
+
+        self._save_snapshot(best_x, pwr_best, tau_t, alpha_best,
+                            triggered_score, triggered_ch, label)
+
+        return True, triggered_score
+
+    # =========================================================================
+    # 诊断快照（保留 v2.x 功能，升级为 CAF 谱可视化）
+    # =========================================================================
+    def _save_snapshot(
+        self,
+        x: np.ndarray,
+        power: float,
+        tau: int,
+        alpha_best_hz: float,
+        score: float,
+        channel: str,
+        label: str,
+    ):
+        """生成并保存 CAF 谱快照（双子图：τ=30k 通道 + τ=15k 通道）。"""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+            matplotlib.rcParams['axes.unicode_minus'] = False
+            import matplotlib.pyplot as plt, os
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+            for ax, tau_plot, alpha_range, ch_label in [
+                (axes[0], self.TAU_OCUSYNC_30K, self.ALPHA_SCAN_30K, '30kHz'),
+                (axes[1], self.TAU_OCUSYNC_15K, self.ALPHA_SCAN_15K, '15kHz'),
+            ]:
+                spec = self._compute_caf_spectrum(x, tau_plot, power)
+                N    = len(spec)
+                f_hz = np.arange(N) * (self.sample_rate / N)
+                # 仅绘制 0~350kHz（包含 WiFi 标志位，方便对比）
+                mask = f_hz < 350_000
+                ax.semilogy(f_hz[mask] / 1e3, spec[mask] + 1e-6,
+                            color='#FF5722', linewidth=1.0, label='CAF-NCC 谱')
+                ax.axvspan(alpha_range[0]/1e3, alpha_range[1]/1e3,
+                           alpha=0.15, color='lime', label='OcuSync α 扫描窗口')
+                ax.axvline(self.ALPHA_WIFI_HZ / 1e3, color='orange',
+                           linestyle='--', lw=1.2, label='WiFi 250kHz')
+                ax.axvline(alpha_best_hz / 1e3 if channel == ('30k' if ch_label=='30kHz' else '15k')
+                           else 0, color='cyan', linestyle=':', lw=1.5, label=f'α_best')
+                ax.axhline(self.THRESHOLD_30K if ch_label=='30kHz' else self.THRESHOLD_15K,
+                           color='red', linestyle='--', lw=1, label='检测阈值')
+                ax.set_title(f"CAF 谱 τ={tau_plot}  ({ch_label} 通道)", fontsize=11)
+                ax.set_xlabel("循环频率 α (kHz)")
+                ax.set_ylabel("NCC (log)")
+                ax.legend(fontsize=7)
+                ax.grid(alpha=0.3)
+                ax.set_xlim(0, 350)
+
+            fig.suptitle(
+                f"S3 CAF-FFT Audit — {label}\n"
+                f"NCC={score*100:.2f}%  α={alpha_best_hz/1e3:.2f}kHz",
+                fontsize=12, fontweight='bold'
+            )
+            plt.tight_layout()
+
+            db_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  '..', 'database', 'alert_images')
+            os.makedirs(db_dir, exist_ok=True)
+            ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+            path = os.path.join(db_dir, f'S3_CAF_{channel}_{ts}.png')
+            plt.savefig(path, dpi=130)
+            plt.close()
+            print(f"  [S3-v3] 快照已保存 → {path}")
+        except Exception as e:
+            print(f"  [S3-v3] 快照生成失败（不影响检测）: {e}")
