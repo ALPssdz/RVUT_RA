@@ -76,13 +76,14 @@ IQ 码流采集（AD9364，采样率 40 MSps，单次捕获 262 万采样点 / 6
 ```
 RF-Vision-UAV-Tracker/
 ├── system_hub.py            # 系统入口与中央管线调度引擎
-├── config.py                # 硬件参数统一配置中心
 ├── backend_rk3588/
+│   ├── config.py            # 硬件参数统一配置中心
 │   └── main_rf_pipeline.py  # RFToolchain：S1→S2→S3 流水线主控
 ├── rf_zynq/
 │   ├── rf_stage1_rssi_scan.py       # S1：跨扇区 RSSI 快速功率预扫
 │   ├── rf_stage2_waterfall_yolo.py  # S2：IQ → STFT 瀑布图张量生成
 │   ├── rf_stage3_cyclostationary.py # S3：CAF-FFT 循环频率判别器
+│   ├── calibrate_s3.py              # S3 一键现场校准向导
 │   └── rknn_infer.py                # RKNN-Lite2 YOLOv8 NPU 推理封装
 ├── vision_k230/
 │   └── k230_client.py       # RTSP 视频流 + UDP 遥测并发网络客户端
@@ -95,48 +96,24 @@ RF-Vision-UAV-Tracker/
 ├── mock_transmitter/
 │   ├── uav_tx_gui.py        # PlutoSDR 无人机射频靶机控制台（GUI）
 │   └── mock_k230.py         # PC 侧 K230 模拟器（MJPEG 流 + UDP 遥测）
-├── calibrate_s3.py              # S3 一键现场校准向导（背景测量→阈值计算→自动写入）
-├── deploy_orangepi.sh           # 香橙派 5 一键环境装配脚本
-└── start_rf_vision.sh           # 系统一键拉起脚本
+├── deploy_orangepi.sh           # 香橙派 5 首次部署一键环境装配脚本
 ```
 
 ## 6. 部署与装配指南
 
 ```bash
-# 克隆仓库并执行自动化环境配置
+# 克隆仓库
 git clone https://github.com/ALPssdz/RF-Vision-UAV-Tracker.git
 cd RF-Vision-UAV-Tracker
-bash deploy_orangepi.sh
 
-# 在 x86 Linux / WSL2 上将 YOLOv8 权重转换为 RKNN INT8 模型
+# 启动系统（首次启动会提示是否运行 S3 阈值校准）
+python3 system_hub.py
+```
+
+### （可选）将 YOLOv8 权重转换为 RKNN INT8
+
+需在 **x86 Linux / WSL2** 环境执行，转换完成后将 `best.rknn` 复制到香橙派对应路径：
+
+```bash
 python tools/convert_yolo_to_rknn.py
-
-# 将 best.rknn 复制至目标路径后启动系统
-python3 system_hub.py
-```
-
-### S3 阈值现场校准（首次部署推荐）
-
-在新射频环境部署后，运行一键校准向导（约 3 分钟完成）：
-
-```bash
-python3 calibrate_s3.py
-```
-
-向导交互流程：
-
-```
-Phase 1 — 背景噪声基线（UAV 关机）
-  → 各扇区 CAF-NCC 环境本底自动测量
-
-Phase 2 — 阈值计算与自动写入
-  → 一键计算最优 THRESHOLD_30K / THRESHOLD_15K
-  → 自动写入 rf_zynq/rf_stage3_cyclostationary.py
-  → 生成校准报告图（database/alert_images/）
-```
-
-校准完成后重启系统，新阈值立即生效：
-
-```bash
-python3 system_hub.py
 ```

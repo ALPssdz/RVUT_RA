@@ -77,13 +77,14 @@ Both trigger paths produce a fused composite evidence image (RF waterfall + opti
 ```
 RF-Vision-UAV-Tracker/
 ├── system_hub.py            # Entry point & central pipeline orchestrator
-├── config.py                # Centralized hardware configuration
 ├── backend_rk3588/
+│   ├── config.py            # Centralized hardware configuration
 │   └── main_rf_pipeline.py  # RFToolchain: S1→S2→S3 pipeline controller
 ├── rf_zynq/
 │   ├── rf_stage1_rssi_scan.py       # S1: Fast RSSI frequency scan
 │   ├── rf_stage2_waterfall_yolo.py  # S2: IQ → STFT waterfall tensor
 │   ├── rf_stage3_cyclostationary.py # S3: CAF-FFT cyclic frequency discriminator
+│   ├── calibrate_s3.py              # S3 one-click field calibration wizard
 │   └── rknn_infer.py                # RKNN-Lite2 YOLOv8 NPU inference wrapper
 ├── vision_k230/
 │   └── k230_client.py       # RTSP video + UDP telemetry network client
@@ -96,52 +97,24 @@ RF-Vision-UAV-Tracker/
 ├── mock_transmitter/
 │   ├── uav_tx_gui.py        # PlutoSDR UAV RF target simulator GUI
 │   └── mock_k230.py         # PC-side K230 simulator (MJPEG + UDP)
-├── calibrate_s3.py              # S3 one-click field calibration wizard
 ├── deploy_orangepi.sh           # One-shot Orange Pi 5 environment setup
-└── start_rf_vision.sh           # One-click system launch script
 ```
 
 ## 6. Deployment Instructions
 
 ```bash
-# Clone and run the automated environment setup script
+# Clone the repository
 git clone https://github.com/ALPssdz/RF-Vision-UAV-Tracker.git
 cd RF-Vision-UAV-Tracker
-bash deploy_orangepi.sh
 
-# Convert YOLOv8 weights to RKNN INT8 (run on x86 Linux / WSL2)
+# Launch the system (first run will prompt for S3 threshold calibration)
+python3 system_hub.py
+```
+
+### (Optional) Convert YOLOv8 Weights to RKNN INT8
+
+Run on **x86 Linux / WSL2**, then copy `best.rknn` to the Orange Pi:
+
+```bash
 python tools/convert_yolo_to_rknn.py
-
-# Copy best.rknn to the target path, then launch
-python3 system_hub.py
-```
-
-### S3 Threshold Calibration (Recommended After Deployment)
-
-After deploying in a new RF environment, run the one-click calibration wizard
-(completes in ~3 minutes):
-
-```bash
-python3 calibrate_s3.py
-```
-
-The interactive wizard guides you through three phases:
-
-```
-Phase 1 — Background Noise Baseline (UAV OFF)
-  → Automatically measures CAF-NCC ambient floor across all sectors
-
-Phase 2 — Live UAV Signal Measurement (UAV ON, optional)
-  → Measures real OcuSync signal strength to validate SNR margin
-
-Phase 3 — Threshold Derivation & Auto-Patch
-  → Calculates optimal THRESHOLD_30K / THRESHOLD_15K
-  → Automatically patches rf_zynq/rf_stage3_cyclostationary.py
-  → Saves calibration report plot (database/alert_images/)
-```
-
-Restart the system after calibration — new thresholds take effect immediately:
-
-```bash
-python3 system_hub.py
 ```

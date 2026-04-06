@@ -44,7 +44,7 @@ fi
 # ── [4/4] 验证 ────────────────────────────────────────────────────────────────
 echo "[4/4] 基础验证..."
 python3 -c "import numpy, cv2, matplotlib, PyQt5; print('  [OK] 基础依赖验证通过')"
-python3 -c "import config; print(f'  [OK] IS_RK3588={config.IS_RK3588} | YOLO_BACKEND={config.YOLO_BACKEND}')"
+python3 -c "from backend_rk3588 import config; print(f'  [OK] IS_RK3588={config.IS_RK3588} | YOLO_BACKEND={config.YOLO_BACKEND}')"
 
 echo ""
 echo "=================================="
