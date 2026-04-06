@@ -106,7 +106,7 @@ RF-Vision-UAV-Tracker/
 git clone https://github.com/ALPssdz/RF-Vision-UAV-Tracker.git
 cd RF-Vision-UAV-Tracker
 
-# 启动系统（首次启动会提示是否运行 S3 阈值校准）
+# 启动系统（每次启动自动测量环境底噪并更新 S3 阈值）
 python3 system_hub.py
 ```
 

@@ -166,14 +166,14 @@ class CentralHubEngine(QObject):
         self.k230_client.stop()
 
 if __name__ == "__main__":
-    # ── 首次启动判断：如果用户需要现场重新校准阈值，在 GUI 拉起前先运行校准向导──
-    print("[RF-Vision] 启动检查：是否先运行 S3 CAF-FFT 阈值校准？")
-    print("            (建议首次就位或环境显著变化时运行，约 3 分钟)")
-    _ans = input("            [y/N] ≥ ").strip().lower()
-    if _ans == 'y':
+    # ── 每次启动前自动测量环境底噪并更新 S3 阈值 ──────────────────────────────
+    print("[RF-Vision] 正在执行 S3 CAF-FFT 环境底噪自动校准...")
+    try:
         from rf_zynq.calibrate_s3 import main as _calibrate
         _calibrate()
-        print("[RF-Vision] 校准完成，正在启动主系统...\n")
+        print("[RF-Vision] 底噪校准完成，正在启动主系统...\n")
+    except Exception as _e:
+        print(f"[RF-Vision] 校准过程出错（{_e}），使用上次保存的阈值继续启动。\n")
 
     app = QApplication(sys.argv)
     hub = CentralHubEngine()
