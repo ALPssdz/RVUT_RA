@@ -43,30 +43,25 @@ N_CAPTURES  = 8           # IQ captures per sector (8 frames -> more stable bg e
 # Larger chunks (400k) were found to amplify SMPS harmonic NCC because the
 # integration window covers more exact SMPS cycles -> REVERTED to 200k.
 CHUNK_SIZE       = 200_000
+OVERLAP          = 0.75    # 75% overlap -- matches run_spectral_audit() exactly
 TAU_30K, TAU_15K = 1333, 2667
 ALPHA_SCAN_30K   = (22_000.0, 30_000.0)   # narrowed to OcuSync CP range
 ALPHA_SCAN_15K   = (10_500.0, 14_500.0)
 MIN_POWER_GATE   = 1e-5
 
 # -- Threshold derivation parameters ------------------------------------------
-# Formula: bg_eff = BG_MAX_WEIGHT*max + (1-BG_MAX_WEIGHT)*avg
-#          th = max(HARD_FLOOR, bg_eff * NOISE_MARGIN)
+# Formula:
+#   bg_eff = BG_P95_WEIGHT * p95 + (1 - BG_P95_WEIGHT) * avg
+#   th     = max(HARD_FLOOR, bg_eff * NOISE_MARGIN)
 #
-# Rationale for weighted estimate:
-#   Using raw max is dominated by single outlier bursts (SMPS spikes), which
-#   can be 3-4x above the typical NCC level.  A weighted average (0.4*max +
-#   0.6*avg) reduces outlier influence while retaining sensitivity to
-#   sustained elevated backgrounds.
-#
-# NOISE_MARGIN = 2.0: the primary false-alarm guard is NOT the NCC threshold
-# alone, but the Level 3 PSR test (peak-to-sidelobe ratio of the tau-domain
-# CAF) and Level 4 CFS test (cyclic-frequency concentration).
-# True OcuSync: PSR >> 2.5, CFS >> 1.8 -> passes both gates.
-# SMPS burst: PSR ~ 1.0-1.5, CFS ~ 1.0-1.2 -> rejected by both gates.
-# This allows NOISE_MARGIN to be set tightly (2.0x) while keeping overall
-# system Pfa < 0.1% via the multi-stage funnel.
+# P95 replaces raw max for outlier robustness:
+#   raw max is dominated by single burst events (SMPS spikes, multipath) that
+#   can be 3-4x above the typical NCC level.  P95 is robust to the top 5% of
+#   burst events while still capturing sustained elevated backgrounds.
+#   NOISE_MARGIN = 2.0 applies on this tighter estimate; PSR + CFS gates
+#   provide the remaining false-alarm suppression at runtime.
 NOISE_MARGIN   = 2.0
-BG_MAX_WEIGHT  = 0.4    # weight on bg_max;  (1-0.4)=0.6 weight on bg_avg
+BG_P95_WEIGHT  = 0.4    # weight on bg_p95; (1-0.4)=0.6 weight on bg_avg
 HARD_FLOOR_30K = 0.018  # 1.8%  (8x theoretical NCC floor 1/sqrt(200000))
 HARD_FLOOR_15K = 0.014  # 1.4%  (6x theoretical NCC floor)
 
@@ -147,14 +142,24 @@ def phase1_background():
     """
     Measure CAF-NCC ambient floor across all sectors (UAV must be OFF).
 
+    Upgrade over v1.0:
+      Previously only one chunk (the center slice) was extracted per buffer.
+      Now all overlapping chunks (OVERLAP=0.75, identical to run_spectral_audit)
+      are analyzed per buffer, giving ~13x more frames per sector for a far
+      more stable and representative background distribution.
+
     Returns
     -------
-    dict : {freq_hz: {'ncc_30k_max': float, 'ncc_15k_max': float,
-                      'ncc_30k_avg': float, 'ncc_15k_avg': float}}
+    dict : {freq_hz: {'ncc_30k_p95': float, 'ncc_15k_p95': float,
+                      'ncc_30k_avg': float, 'ncc_15k_avg': float,
+                      'ncc_30k_max': float, 'ncc_15k_max': float}}
     """
     print("\n" + "=" * 60)
     print("  Phase 1 -- Background noise baseline (UAV OFF)")
+    print(f"  Overlap={OVERLAP*100:.0f}%  ChunkSize={CHUNK_SIZE}  Captures={N_CAPTURES}")
     print("=" * 60)
+
+    step_size = int(CHUNK_SIZE * (1.0 - OVERLAP))   # 75% overlap → step = 50000
 
     results = {}
     for freq in SECTORS_HZ:
@@ -163,30 +168,44 @@ def phase1_background():
 
         if not bufs:
             print(f"  SDR offline -- sector {freq/1e6:.0f}MHz skipped (using defaults)")
-            results[freq] = {'ncc_30k_max': 0.030, 'ncc_15k_max': 0.025,
-                             'ncc_30k_avg': 0.015, 'ncc_15k_avg': 0.013}
+            results[freq] = {
+                'ncc_30k_p95': 0.030, 'ncc_15k_p95': 0.025,
+                'ncc_30k_avg': 0.015, 'ncc_15k_avg': 0.013,
+                'ncc_30k_max': 0.035, 'ncc_15k_max': 0.030,
+            }
             continue
 
-        ncc30_list, ncc15_list = [], []
+        ncc30_all, ncc15_all = [], []   # all chunk-level NCC values across all buffers
         for buf in bufs:
-            chunk = buf[BUFFER_SIZE // 2: BUFFER_SIZE // 2 + CHUNK_SIZE]
-            n30, _ = _caf_ncc_peak(chunk, TAU_30K, ALPHA_SCAN_30K)
-            n15, _ = _caf_ncc_peak(chunk, TAU_15K, ALPHA_SCAN_15K)
-            ncc30_list.append(n30)
-            ncc15_list.append(n15)
+            buf_arr = np.asarray(buf)
+            total   = len(buf_arr)
+            # Slide overlapping windows across the full buffer
+            for i in range(0, total - CHUNK_SIZE, step_size):
+                chunk = buf_arr[i: i + CHUNK_SIZE]
+                n30, _ = _caf_ncc_peak(chunk, TAU_30K, ALPHA_SCAN_30K)
+                n15, _ = _caf_ncc_peak(chunk, TAU_15K, ALPHA_SCAN_15K)
+                ncc30_all.append(n30)
+                ncc15_all.append(n15)
 
+        arr30 = np.array(ncc30_all)
+        arr15 = np.array(ncc15_all)
         r = {
-            'ncc_30k_max': float(np.max(ncc30_list)),
-            'ncc_15k_max': float(np.max(ncc15_list)),
-            'ncc_30k_avg': float(np.mean(ncc30_list)),
-            'ncc_15k_avg': float(np.mean(ncc15_list)),
+            'ncc_30k_p95': float(np.percentile(arr30, 95)),
+            'ncc_15k_p95': float(np.percentile(arr15, 95)),
+            'ncc_30k_avg': float(arr30.mean()),
+            'ncc_15k_avg': float(arr15.mean()),
+            'ncc_30k_max': float(arr30.max()),
+            'ncc_15k_max': float(arr15.max()),
         }
         results[freq] = r
 
+        n_chunks = len(ncc30_all)
+        print(f"    Chunks analyzed: {n_chunks} "
+              f"({N_CAPTURES} buffers × ~{n_chunks//N_CAPTURES} chunks/buf)")
         print(f"    OcuSync 30kHz: avg={r['ncc_30k_avg']*100:.2f}%  "
-              f"max={r['ncc_30k_max']*100:.2f}%")
+              f"p95={r['ncc_30k_p95']*100:.2f}%  max={r['ncc_30k_max']*100:.2f}%")
         print(f"    OcuSync 15kHz: avg={r['ncc_15k_avg']*100:.2f}%  "
-              f"max={r['ncc_15k_max']*100:.2f}%")
+              f"p95={r['ncc_15k_p95']*100:.2f}%  max={r['ncc_15k_max']*100:.2f}%")
 
     return results
 
@@ -196,18 +215,19 @@ def phase1_background():
 # =============================================================================
 def _derive_thresholds(bg_results):
     """
-    Derive per-sector thresholds using an outlier-robust background estimate.
+    Derive per-sector thresholds using a P95-based outlier-robust estimate.
 
     Formula:
-      bg_eff = BG_MAX_WEIGHT * bg_max + (1 - BG_MAX_WEIGHT) * bg_avg
+      bg_eff = BG_P95_WEIGHT * bg_p95 + (1 - BG_P95_WEIGHT) * bg_avg
       th     = max(HARD_FLOOR, bg_eff * NOISE_MARGIN)
 
     Statistical rationale:
-      Raw max is dominated by single burst events (SMPS spikes, multipath).
-      A weighted average (40% max + 60% avg) reduces outlier influence while
-      still accounting for occasional elevated backgrounds.
-      NOISE_MARGIN=3 on this tighter estimate provides the same guard as ~5x
-      on the raw max for typical ambient conditions.
+      P95 replaces raw max to suppress single-spike outliers (SMPS bursts)
+      that can inflate the threshold by 3-4x versus the typical background.
+      P95 still captures the 95th-percentile noise level (sustained bursts),
+      while the remaining suppression is delegated to PSR + CFS runtime gates.
+      NOISE_MARGIN=2.0 on a P95-based estimate is statistically equivalent to
+      ~4x on the raw max for typical 5.8 GHz indoor environments.
 
     Returns
     -------
@@ -216,14 +236,15 @@ def _derive_thresholds(bg_results):
     per_sector = {}
     for freq in SECTORS_HZ:
         bg    = bg_results.get(freq, {})
-        # Weighted background estimates
-        max30 = bg.get('ncc_30k_max', HARD_FLOOR_30K / NOISE_MARGIN)
-        avg30 = bg.get('ncc_30k_avg', max30 * 0.5)
-        max15 = bg.get('ncc_15k_max', HARD_FLOOR_15K / NOISE_MARGIN)
-        avg15 = bg.get('ncc_15k_avg', max15 * 0.5)
+        # P95 + avg (fallback to conservative defaults if absent)
+        p95_30 = bg.get('ncc_30k_p95', HARD_FLOOR_30K / NOISE_MARGIN)
+        avg30  = bg.get('ncc_30k_avg', p95_30 * 0.5)
+        p95_15 = bg.get('ncc_15k_p95', HARD_FLOOR_15K / NOISE_MARGIN)
+        avg15  = bg.get('ncc_15k_avg', p95_15 * 0.5)
 
-        bg_eff_30 = BG_MAX_WEIGHT * max30 + (1 - BG_MAX_WEIGHT) * avg30
-        bg_eff_15 = BG_MAX_WEIGHT * max15 + (1 - BG_MAX_WEIGHT) * avg15
+        # Weighted P95-based effective background
+        bg_eff_30 = BG_P95_WEIGHT * p95_30 + (1 - BG_P95_WEIGHT) * avg30
+        bg_eff_15 = BG_P95_WEIGHT * p95_15 + (1 - BG_P95_WEIGHT) * avg15
 
         per_sector[freq] = {
             'th_30k': max(HARD_FLOOR_30K, bg_eff_30 * NOISE_MARGIN),
@@ -297,16 +318,19 @@ def _save_report(bg_results, per_sector_th):
             th_30k = th['th_30k']
             th_15k = th['th_15k']
             values = [
-                bg.get('ncc_30k_max', 0) * 100,
-                bg.get('ncc_15k_max', 0) * 100,
+                bg.get('ncc_30k_p95', 0) * 100,
+                bg.get('ncc_15k_p95', 0) * 100,
                 bg.get('ncc_30k_avg', 0) * 100,
                 bg.get('ncc_15k_avg', 0) * 100,
+                bg.get('ncc_30k_max', 0) * 100,
+                bg.get('ncc_15k_max', 0) * 100,
             ]
-            colors = ['#EF5350', '#FF7043', '#78909C', '#90A4AE']
-            labels = ['BG 30kHz max', 'BG 15kHz max',
-                      'BG 30kHz avg', 'BG 15kHz avg']
+            colors = ['#EF5350', '#FF7043', '#78909C', '#90A4AE', '#B71C1C', '#BF360C']
+            labels = ['BG 30kHz P95', 'BG 15kHz P95',
+                      'BG 30kHz avg', 'BG 15kHz avg',
+                      'BG 30kHz max', 'BG 15kHz max']
 
-            bars = ax.bar(labels, values, color=colors, alpha=0.85, width=0.5)
+            bars = ax.bar(labels, values, color=colors, alpha=0.85, width=0.6)
             ax.axhline(th_30k * 100, color='#1565C0', linestyle='--',
                        linewidth=1.5, label=f'TH_30k={th_30k*100:.1f}%')
             ax.axhline(th_15k * 100, color='#2E7D32', linestyle='--',

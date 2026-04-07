@@ -58,6 +58,19 @@ class CentralHubEngine(QObject):
         self._master_thread = None
         self._tick_lock     = threading.Lock()  # 防止 tick() 在 stop/start 切换时重入
 
+        # ── 时序持久化滤波器（Temporal Persistence Filter）──────────────────────
+        # 原理：
+        #   单次 SMPS 瞬态可偶发通过 PSR+CFS 门限（1 tick 误报）
+        #   真实 OcuSync 信号持续传输，连续多个 tick 均会确认
+        # 虚警率公式：
+        #   P_fa_final = P_fa_tick ^ N
+        #   N=2, P_fa_tick=5% → P_fa_final = 0.25%（大幅除虚警）
+        #   OcuSync 实际连续检测概率 ≈ 0.95^2 = 90%，延迟仅增加 1 tick
+        self._rf_confirm_streak  = 0
+        self._rf_confirm_info    = {}   # 缓存最近一次有效告警信息
+        self.RF_CONFIRM_REQUIRED = 2    # 连续 2 tick 确认才入库报警
+
+
         # RF 与视觉通道的最新帧缓存（供多模态证据融合使用）
         self.cache_rf  = np.zeros((640, 640, 3),  dtype=np.uint8)
         self.cache_vis = np.zeros((640, 1137, 3), dtype=np.uint8)
@@ -124,12 +137,37 @@ class CentralHubEngine(QObject):
                 if rf_log.strip():
                     self.signal_log.emit(rf_log)
 
+                # ── 时序持久化滤波器（TPF）────────────────────────────────────────
+                # 数学模型：P_fa_final = P_fa_tick^N（N=2 时虚警率平方降）
+                # OcuSync 真实连续检测概率 ≈ 0.95^2 = 90%，延迟仅增加 1 tick
+                # ────────────────────────────────────────────────────────────────
                 if rf_alert:
-                    self.signal_system_status.emit({"system": "[!] Alert: OcuSync RF Detected!", "color": "#e74c3c"})
-                    freq = rf_info.get("freq_mhz", 0.0)
-                    score = rf_info.get("score", 0.0)
-                    self._trigger_composite_save("SDR_OMNI_TRIGGER", freq, score)
+                    self._rf_confirm_streak += 1
+                    self._rf_confirm_info    = rf_info
+                    streak = self._rf_confirm_streak
+                    self.signal_log.emit(
+                        f"[TPF] S3 确认 {streak}/{self.RF_CONFIRM_REQUIRED} tick "
+                        f"(freq={rf_info.get('freq_mhz',0):.0f}MHz "
+                        f"score={rf_info.get('score',0)*100:.1f}%)")
+
+                    if streak >= self.RF_CONFIRM_REQUIRED:
+                        # 连续确认达标 → 发出最终告警
+                        self.signal_system_status.emit({
+                            "system": "[!] Alert: OcuSync RF Detected!",
+                            "color":  "#e74c3c",
+                            "alert":  True,   # 语义字段：GUI 告警计数使用
+                        })
+                        freq  = self._rf_confirm_info.get("freq_mhz", 0.0)
+                        score = self._rf_confirm_info.get("score",    0.0)
+                        self._trigger_composite_save("SDR_OMNI_TRIGGER", freq, score)
+                        # 不重置 streak，维持告警状态直到信号消失
                 else:
+                    # S3 未通过：重置连续计数器
+                    if self._rf_confirm_streak > 0:
+                        self.signal_log.emit(
+                            f"[TPF] 连续确认中断（streak 重置: "
+                            f"{self._rf_confirm_streak} → 0）")
+                    self._rf_confirm_streak = 0
                     self.signal_system_status.emit({
                         "system": f"系统状态: [扫描] ({rf_info.get('freq_mhz', 0):.0f}MHz)" if rf_info else "系统状态: 主管道全速扫描中...",
                         "color": "#27ae60"
@@ -150,7 +188,11 @@ class CentralHubEngine(QObject):
                         cv2.rectangle(k_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 8)
                         cv2.putText(k_frame, "OOB JSON LOCK", (bbox[0], bbox[1]-20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
                         
-                    self.signal_system_status.emit({"system": "特征命中：目标物理轮廓验证通过", "color": "#e74c3c"})
+                    self.signal_system_status.emit({
+                        "system": "特征命中：目标物理轮廓验证通过",
+                        "color":  "#e74c3c",
+                        "alert":  True,   # 语义字段—GUI 告警计数使用
+                    })
                     self.signal_log.emit("OOB 触发器：高速网络侧带外接收到正向标定数据包。")
                     self._trigger_composite_save("K230_ZENITH_TRIGGER", 0.0, 1.0)
                 
