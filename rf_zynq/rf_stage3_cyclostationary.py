@@ -117,6 +117,16 @@ class RF_Stage3_CycloAudit:
         # Populated from s3_thresholds.json (git-ignored, written by calibrate_s3.py).
         # Falls back to class-level defaults when JSON is absent.
         self._sector_thresholds: dict = {}
+
+        # Per-sector calibrated WiFi ambient NCC: {freq_hz_int: mean_wifi_ncc}
+        # Used to dynamically set the WiFi-detection trigger threshold for PSR.
+        # Replaces hardcoded 0.010 with an environment-aware value:
+        #   wifi_trigger_th = max(0.010, wifi_ambient[sector] * 2.0)
+        # This ensures the PSR guard adapts to local WiFi density:
+        #   Quiet env (WiFi NCC 0.3%): trigger = max(1.0%, 0.6%) = 1.0% (standard)
+        #   Dense WiFi (WiFi NCC 2.0%): trigger = max(1.0%, 4.0%) = 4.0% (stricter)
+        self._wifi_ambient: dict = {}
+
         import os, json
         _json = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "s3_thresholds.json")
@@ -141,6 +151,16 @@ class RF_Stage3_CycloAudit:
                     print(f"  [S3] Global thresholds loaded (legacy JSON): "
                           f"30k={self.THRESHOLD_30K*100:.2f}%  "
                           f"15k={self.THRESHOLD_15K*100:.2f}%")
+
+                # Load WiFi ambient calibration (written by calibrate_s3 v2)
+                if "wifi_ambient" in _t:
+                    self._wifi_ambient = {int(k): float(v)
+                                          for k, v in _t["wifi_ambient"].items()}
+                    print("  [S3] WiFi ambient NCC loaded from JSON:")
+                    for f, w in self._wifi_ambient.items():
+                        print(f"       {f/1e6:.0f} MHz  WiFi_ambient={w*100:.3f}%  "
+                              f"PSR_trigger_th={max(0.010, w*2.0)*100:.3f}%")
+
             except Exception as _e:
                 print(f"  [S3] Failed to load s3_thresholds.json ({_e}), using defaults.")
 
@@ -421,10 +441,18 @@ class RF_Stage3_CycloAudit:
             pwr_best = self.MIN_POWER_GATE
 
         # ── Level 3：τ 域 PSR 验证 ──────────────────────────────────────────
-        # 根据 WiFi 监控值动态调整 PSR 要求：
-        # wifi_ncc > 0.01 说明 250kHz 通道有能量（WiFi 存在），但不代表 OcuSync 误报，
-        # 仅作为上调 PSR 严格程度的依据。
-        psr_th = self.PSR_THRESHOLD_WIFI if wifi_ncc > 0.010 else self.PSR_THRESHOLD
+        # 根据标定的 WiFi ambient NCC 动态确定 PSR 触发阈值：
+        #   wifi_trigger_th = max(0.010, wifi_ambient[sector] × 2.0)
+        # 物理含义：当观测到的 WiFi NCC 超过 2× 标定环境底噪时，
+        # 说明当前 WiFi 干扰强于标定时的环境，上调 PSR 门限抑制误报。
+        # 替代原来的硬编码 0.010，实现跨部署环境的自适应。
+        if self._wifi_ambient and sector_hz is not None:
+            _closest = min(self._wifi_ambient, key=lambda k: abs(k - int(sector_hz)))
+            _wifi_cal = self._wifi_ambient[_closest]
+        else:
+            _wifi_cal = 0.0
+        wifi_trigger_th = max(0.010, _wifi_cal * 2.0)
+        psr_th = self.PSR_THRESHOLD_WIFI if wifi_ncc > wifi_trigger_th else self.PSR_THRESHOLD
         psr    = self._compute_psr(best_x, pwr_best, tau_t, alpha_best)
 
         print(

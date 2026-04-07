@@ -58,17 +58,21 @@ class CentralHubEngine(QObject):
         self._master_thread = None
         self._tick_lock     = threading.Lock()  # 防止 tick() 在 stop/start 切换时重入
 
-        # ── 时序持久化滤波器（Temporal Persistence Filter）──────────────────────
-        # 原理：
-        #   单次 SMPS 瞬态可偶发通过 PSR+CFS 门限（1 tick 误报）
-        #   真实 OcuSync 信号持续传输，连续多个 tick 均会确认
-        # 虚警率公式：
-        #   P_fa_final = P_fa_tick ^ N
-        #   N=2, P_fa_tick=5% → P_fa_final = 0.25%（大幅除虚警）
-        #   OcuSync 实际连续检测概率 ≈ 0.95^2 = 90%，延迟仅增加 1 tick
-        self._rf_confirm_streak  = 0
-        self._rf_confirm_info    = {}   # 缓存最近一次有效告警信息
-        self.RF_CONFIRM_REQUIRED = 2    # 连续 2 tick 确认才入库报警
+        # ── 时序持久化滤波器（Temporal Persistence Filter v2）───────────────────
+        # 自适应 bypass 机制：
+        #   强信号（score ≥ bypass_th）：单 tick 直通，0 延迟
+        #   普通信号（th ≤ score < bypass_th）：2-tick 确认
+        #   噪声（score < th）：streak 重置
+        #
+        # 虚警率模型（弱信号分支）：P_fa_final = P_fa_tick^N
+        #   N=2, P_fa_tick=5% → P_fa_final = 0.25%
+        # 强信号旁路条件（单 tick）：
+        #   score ≥ BYPASS_RATIO × th ≈ 6~12%（典型 OcuSync 近场 NCC 8~25%）
+        #   在此 NCC 量级下，PSR+CFS 双重门限已保证 Pfa < 0.1%，TPF 无需介入
+        self._rf_confirm_streak   = 0
+        self._rf_confirm_info     = {}    # 缓存最近一次有效告警信息
+        self.RF_CONFIRM_REQUIRED  = 2     # 弱信号分支：连续 2 tick 才入库报警
+        self.RF_STRONG_BYPASS_RATIO = 3.0 # 强信号旁路：score ≥ 3× 阈值时单 tick 直通
 
 
         # RF 与视觉通道的最新帧缓存（供多模态证据融合使用）
@@ -92,6 +96,39 @@ class CentralHubEngine(QObject):
         self._master_thread = threading.Thread(target=self._hub_loop, daemon=True)
         self._master_thread.start()
         
+    def _get_bypass_threshold(self, freq_mhz: float) -> float:
+        """
+        计算强信号旁路阈值（bypass threshold）。
+
+        原理：
+          当 S3 NCC 得分超过检测阈值 RF_STRONG_BYPASS_RATIO 倍时，
+          统计上 PSR+CFS 双重门限已足够排除误报，TPF 2-tick 等待无需介入。
+
+          bypass_th = max(th_30k, th_15k) × RF_STRONG_BYPASS_RATIO
+
+          优先使用 calibrate_s3 写入的每扇区标定阈值；
+          JSON 缺失时回退到类级别硬编码下限 × BYPASS_RATIO。
+
+        Parameters
+        ----------
+        freq_mhz : float — 当前扇区中心频率（MHz）
+
+        Returns
+        -------
+        float — bypass NCC 绝对阈值
+        """
+        try:
+            thresholds = self.rf_toolchain.stage3_audit._sector_thresholds
+            if thresholds:
+                freq_hz = freq_mhz * 1e6
+                key = min(thresholds, key=lambda k: abs(k - int(freq_hz)))
+                th_30k, th_15k = thresholds[key]
+                return max(th_30k, th_15k) * self.RF_STRONG_BYPASS_RATIO
+        except Exception:
+            pass
+        # 回退：使用硬编码下限（1.8% × 3.0 = 5.4%）
+        return 0.018 * self.RF_STRONG_BYPASS_RATIO
+
     def stop_sensing(self):
         self.running = False
         self.signal_system_status.emit({"system": "系统模式: [挂起] 任务挂起", "color": "#f1c40f"})
@@ -137,32 +174,54 @@ class CentralHubEngine(QObject):
                 if rf_log.strip():
                     self.signal_log.emit(rf_log)
 
-                # ── 时序持久化滤波器（TPF）────────────────────────────────────────
-                # 数学模型：P_fa_final = P_fa_tick^N（N=2 时虚警率平方降）
-                # OcuSync 真实连续检测概率 ≈ 0.95^2 = 90%，延迟仅增加 1 tick
+                # ── 自适应时序持久化滤波器（Adaptive TPF v2）─────────────────────
+                # 分支 A — 强信号旁路（bypass）:
+                #   score ≥ 3× th_calibrated → 单 tick 直通，无延迟
+                #   Pfa 在此 NCC 量级下由 PSR+CFS 保证 < 0.1%，TPF 无需加锁
+                #
+                # 分支 B — 弱信号确认:
+                #   th ≤ score < 3× th → 维持 2-tick 计数确认（P_fa_final ≈ 0.25%）
+                #
+                # 分支 C — 噪声:
+                #   score < th → streak 归零
                 # ────────────────────────────────────────────────────────────────
                 if rf_alert:
-                    self._rf_confirm_streak += 1
-                    self._rf_confirm_info    = rf_info
-                    streak = self._rf_confirm_streak
-                    self.signal_log.emit(
-                        f"[TPF] S3 确认 {streak}/{self.RF_CONFIRM_REQUIRED} tick "
-                        f"(freq={rf_info.get('freq_mhz',0):.0f}MHz "
-                        f"score={rf_info.get('score',0)*100:.1f}%)")
+                    freq_mhz = rf_info.get("freq_mhz", 0.0)
+                    score    = rf_info.get("score",    0.0)
+                    bypass_th = self._get_bypass_threshold(freq_mhz)
 
-                    if streak >= self.RF_CONFIRM_REQUIRED:
-                        # 连续确认达标 → 发出最终告警
+                    if score >= bypass_th:
+                        # ── 分支 A：强信号直通 ──────────────────────────────────
+                        self._rf_confirm_streak = self.RF_CONFIRM_REQUIRED  # 直接置满
+                        self._rf_confirm_info   = rf_info
+                        self.signal_log.emit(
+                            f"[TPF-BYPASS] 强信号直通！"
+                            f"NCC={score*100:.2f}% ≥ bypass_th={bypass_th*100:.2f}% "
+                            f"({self.RF_STRONG_BYPASS_RATIO:.1f}× th) "
+                            f"freq={freq_mhz:.0f}MHz")
+                    else:
+                        # ── 分支 B：弱信号 2-tick 确认 ──────────────────────────
+                        self._rf_confirm_streak += 1
+                        self._rf_confirm_info    = rf_info
+                        streak = self._rf_confirm_streak
+                        self.signal_log.emit(
+                            f"[TPF] S3 确认 {streak}/{self.RF_CONFIRM_REQUIRED} tick "
+                            f"(freq={freq_mhz:.0f}MHz "
+                            f"score={score*100:.1f}% bypass_th={bypass_th*100:.1f}%)")
+
+                    if self._rf_confirm_streak >= self.RF_CONFIRM_REQUIRED:
+                        # 达标（bypass 直通 或 累计确认）→ 发出最终告警
                         self.signal_system_status.emit({
                             "system": "[!] Alert: OcuSync RF Detected!",
                             "color":  "#e74c3c",
-                            "alert":  True,   # 语义字段：GUI 告警计数使用
+                            "alert":  True,
                         })
                         freq  = self._rf_confirm_info.get("freq_mhz", 0.0)
-                        score = self._rf_confirm_info.get("score",    0.0)
-                        self._trigger_composite_save("SDR_OMNI_TRIGGER", freq, score)
+                        score_out = self._rf_confirm_info.get("score", 0.0)
+                        self._trigger_composite_save("SDR_OMNI_TRIGGER", freq, score_out)
                         # 不重置 streak，维持告警状态直到信号消失
                 else:
-                    # S3 未通过：重置连续计数器
+                    # ── 分支 C：S3 未通过，归零计数器 ──────────────────────────
                     if self._rf_confirm_streak > 0:
                         self.signal_log.emit(
                             f"[TPF] 连续确认中断（streak 重置: "

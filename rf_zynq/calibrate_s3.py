@@ -100,6 +100,38 @@ def _caf_ncc_peak(chunk_raw, tau, alpha_range):
     return float(seg[best_idx]), float((k_lo + best_idx) * f_res)
 
 
+def _wifi_ncc_at_250k(chunk_raw):
+    """
+    Single-frame WiFi CAF-NCC at cycling frequency 250 kHz.
+
+    IEEE 802.11 OFDM symbol period T_sym = 4 us -> cyclic frequency = 250 kHz.
+    This bin is used as a WiFi environment sensor:
+      wifi_ncc >> 0  : active WiFi present in the band
+      wifi_ncc ~ 0   : quiet RF environment
+
+    Returns
+    -------
+    float : normalized CAF amplitude at the WiFi bin
+    """
+    ALPHA_WIFI = 250_000.0   # Hz
+    TAU_WIFI   = 128         # samples @ 40MSPS
+
+    x = chunk_raw.astype(np.complex64) / 32768.0
+    x -= x.mean()
+    power = float(np.mean(np.abs(x) ** 2))
+    if power < MIN_POWER_GATE:
+        return 0.0
+
+    z   = x[TAU_WIFI:] * np.conj(x[:-TAU_WIFI])
+    N_z = len(z)
+    Z   = np.fft.fft(z)
+    ncc = np.abs(Z) / (N_z * (power + 1e-12))
+
+    f_res = SAMPLE_RATE / N_z
+    k_wifi = max(1, min(N_z // 2, int(np.round(ALPHA_WIFI / f_res))))
+    return float(ncc[k_wifi])
+
+
 # =============================================================================
 # SDR capture
 # =============================================================================
@@ -176,6 +208,7 @@ def phase1_background():
             continue
 
         ncc30_all, ncc15_all = [], []   # all chunk-level NCC values across all buffers
+        wifi_all  = []                  # WiFi 250kHz CAF-NCC per chunk
         for buf in bufs:
             buf_arr = np.asarray(buf)
             total   = len(buf_arr)
@@ -184,11 +217,14 @@ def phase1_background():
                 chunk = buf_arr[i: i + CHUNK_SIZE]
                 n30, _ = _caf_ncc_peak(chunk, TAU_30K, ALPHA_SCAN_30K)
                 n15, _ = _caf_ncc_peak(chunk, TAU_15K, ALPHA_SCAN_15K)
+                w      = _wifi_ncc_at_250k(chunk)     # WiFi 环境探针
                 ncc30_all.append(n30)
                 ncc15_all.append(n15)
+                wifi_all.append(w)
 
         arr30 = np.array(ncc30_all)
         arr15 = np.array(ncc15_all)
+        arr_w = np.array(wifi_all)
         r = {
             'ncc_30k_p95': float(np.percentile(arr30, 95)),
             'ncc_15k_p95': float(np.percentile(arr15, 95)),
@@ -196,16 +232,22 @@ def phase1_background():
             'ncc_15k_avg': float(arr15.mean()),
             'ncc_30k_max': float(arr30.max()),
             'ncc_15k_max': float(arr15.max()),
+            'wifi_avg':    float(arr_w.mean()),    # WiFi 250kHz ambient 均值
+            'wifi_p95':    float(np.percentile(arr_w, 95)),  # WiFi P95（PSR 触发线依据）
         }
         results[freq] = r
 
         n_chunks = len(ncc30_all)
         print(f"    Chunks analyzed: {n_chunks} "
-              f"({N_CAPTURES} buffers × ~{n_chunks//N_CAPTURES} chunks/buf)")
+              f"({N_CAPTURES} buffers x ~{n_chunks//N_CAPTURES} chunks/buf)")
         print(f"    OcuSync 30kHz: avg={r['ncc_30k_avg']*100:.2f}%  "
               f"p95={r['ncc_30k_p95']*100:.2f}%  max={r['ncc_30k_max']*100:.2f}%")
         print(f"    OcuSync 15kHz: avg={r['ncc_15k_avg']*100:.2f}%  "
               f"p95={r['ncc_15k_p95']*100:.2f}%  max={r['ncc_15k_max']*100:.2f}%")
+        wifi_trigger = max(0.010, r['wifi_avg'] * 2.0)
+        print(f"    WiFi@250kHz:   avg={r['wifi_avg']*100:.3f}%  "
+              f"p95={r['wifi_p95']*100:.3f}%  "
+              f"=> PSR trigger_th={wifi_trigger*100:.3f}%")
 
     return results
 
@@ -257,19 +299,23 @@ THRESHOLD_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "s3_thresholds.json")
 
 
-def phase2_apply(per_sector_th):
+def phase2_apply(per_sector_th, bg_results=None):
     """
     Persist per-sector calibrated thresholds to s3_thresholds.json.
 
-    JSON schema:
+    JSON schema (v2):
       {
         "sectors": {
           "5745000000": {"th_30k": 0.050, "th_15k": 0.030},
           ...
         },
+        "wifi_ambient": {
+          "5745000000": 0.0045,  # mean WiFi NCC at 250kHz (for adaptive PSR threshold)
+          ...
+        },
         "calibrated_at": "..."
       }
-    RF_Stage3_CycloAudit.__init__() reads this file at startup.
+    RF_Stage3_CycloAudit.__init__() reads both 'sectors' and 'wifi_ambient'.
     """
     import json
     from datetime import datetime
@@ -291,6 +337,21 @@ def phase2_apply(per_sector_th):
         },
         "calibrated_at": datetime.now().isoformat(timespec='seconds'),
     }
+
+    # Attach WiFi ambient data (for adaptive PSR threshold in run_spectral_audit)
+    if bg_results is not None:
+        wifi_payload = {}
+        for freq in SECTORS_HZ:
+            bg = bg_results.get(freq, {})
+            wifi_mean = bg.get('wifi_avg', 0.0)
+            wifi_payload[str(int(freq))] = round(wifi_mean, 6)
+        payload["wifi_ambient"] = wifi_payload
+        print("  WiFi ambient saved:")
+        for k, v in wifi_payload.items():
+            trigger = max(0.010, v * 2.0)
+            print(f"    {int(k)//1000000:.0f} MHz  "
+                  f"wifi_mean={v*100:.3f}%  PSR_trigger_th={trigger*100:.3f}%")
+
     with open(THRESHOLD_JSON, 'w') as f:
         json.dump(payload, f, indent=2)
     print(f"  OK -- thresholds saved.")
@@ -317,6 +378,8 @@ def _save_report(bg_results, per_sector_th):
             th = per_sector_th.get(freq, {'th_30k': HARD_FLOOR_30K, 'th_15k': HARD_FLOOR_15K})
             th_30k = th['th_30k']
             th_15k = th['th_15k']
+            wifi_mean = bg.get('wifi_avg', 0.0)
+            wifi_trigger = max(0.010, wifi_mean * 2.0)
             values = [
                 bg.get('ncc_30k_p95', 0) * 100,
                 bg.get('ncc_15k_p95', 0) * 100,
@@ -324,17 +387,23 @@ def _save_report(bg_results, per_sector_th):
                 bg.get('ncc_15k_avg', 0) * 100,
                 bg.get('ncc_30k_max', 0) * 100,
                 bg.get('ncc_15k_max', 0) * 100,
+                bg.get('wifi_avg',    0) * 100,
+                bg.get('wifi_p95',    0) * 100,
             ]
-            colors = ['#EF5350', '#FF7043', '#78909C', '#90A4AE', '#B71C1C', '#BF360C']
-            labels = ['BG 30kHz P95', 'BG 15kHz P95',
-                      'BG 30kHz avg', 'BG 15kHz avg',
-                      'BG 30kHz max', 'BG 15kHz max']
+            colors = ['#EF5350', '#FF7043', '#78909C', '#90A4AE',
+                      '#B71C1C', '#BF360C', '#AB47BC', '#7B1FA2']
+            labels = ['30k P95', '15k P95',
+                      '30k avg', '15k avg',
+                      '30k max', '15k max',
+                      'WiFi avg', 'WiFi P95']
 
             bars = ax.bar(labels, values, color=colors, alpha=0.85, width=0.6)
             ax.axhline(th_30k * 100, color='#1565C0', linestyle='--',
                        linewidth=1.5, label=f'TH_30k={th_30k*100:.1f}%')
             ax.axhline(th_15k * 100, color='#2E7D32', linestyle='--',
                        linewidth=1.5, label=f'TH_15k={th_15k*100:.1f}%')
+            ax.axhline(wifi_trigger * 100, color='#FF6F00', linestyle=':',
+                       linewidth=1.2, label=f'PSR_trig={wifi_trigger*100:.2f}%')
 
             for bar, val in zip(bars, values):
                 if val > 0:
@@ -369,8 +438,8 @@ def _save_report(bg_results, per_sector_th):
 def main():
     print()
     print("=" * 62)
-    print("  RF-Vision S3 CAF-FFT Auto Calibration v1.1")
-    print("  Ambient NCC floor -> Optimal thresholds -> Auto-patch")
+    print("  RF-Vision S3 CAF-FFT Auto Calibration v2.0")
+    print("  Multi-chunk P95 + WiFi ambient sensing + Adaptive PSR")
     print("=" * 62)
     print(f"  SDR    : {SDR_URI}")
     print(f"  Fs     : {SAMPLE_RATE/1e6:.0f} MSps")
@@ -393,8 +462,22 @@ def main():
     print("  +" + "-" * 46 + "+")
 
     # Auto-write
-    phase2_apply(per_sector_th)
+    phase2_apply(per_sector_th, bg_results=bg_results)
     _save_report(bg_results, per_sector_th)
+
+    # WiFi environment summary
+    print("\n  +" + "-" * 50 + "+")
+    print("  | WiFi Ambient Environment Summary               |")
+    for freq in SECTORS_HZ:
+        bg = bg_results.get(freq, {})
+        w_avg = bg.get('wifi_avg', 0.0)
+        w_trig = max(0.010, w_avg * 2.0)
+        line = (f"  |  {freq/1e6:.0f} MHz  "
+                f"WiFi_avg={w_avg*100:.3f}%  "
+                f"PSR_trigger={w_trig*100:.3f}%")
+        print(line.ljust(52) + "|")
+    print("  +" + "-" * 50 + "+")
+
     print("\n  Calibration complete. New thresholds are active.\n")
 
 
