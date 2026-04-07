@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 """
 ui_qt/orangepi_monitor.py — 本机系统资源监控模块
 ==================================================
@@ -33,6 +34,7 @@ CPU 占用率（psutil 内部使用 /proc/stat 差分，采样间隔 Δt）：
 
 import time
 import threading
+from typing import Optional
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 
@@ -61,7 +63,7 @@ class OrangePiMonitorWorker(QObject):
 
     def __init__(self,
                  interval_s: float = 2.0,
-                 net_iface: str | None = "eth0"):
+                 net_iface: Optional[str] = "eth0"):
         super().__init__()
         self._interval  = interval_s
         self._iface     = net_iface
@@ -173,7 +175,7 @@ class OrangePiMonitor:
 
     def __init__(self,
                  interval_s: float = 2.0,
-                 net_iface: str | None = "eth0",
+                 net_iface: Optional[str] = "eth0",
                  **_ignored_kwargs):
         """
         参数
