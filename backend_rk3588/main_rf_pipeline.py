@@ -230,20 +230,15 @@ class RFToolchain:
 
         if confirm_flag:
             log_lines.append(
-                f"[ALERT] OcuSync 协议特征确认！"
-                f"频点: {active_freq/1e6:.0f} MHz | "
-                f"归一化自相关系数: {audit_score:.4f}"
+                f"[S3-PASS] OcuSync 协议特征吻合 "
+                f"@ {active_freq/1e6:.0f} MHz  "
+                f"NCC={audit_score:.4f}  → 提交 TPF 二次确认"
             )
             alert_flag = True
             alert_info = {"freq_mhz": active_freq / 1e6, "score": audit_score}
-            cv2.putText(annotated_frame, f"S3 LOCK  score={audit_score:.3f}",
+            cv2.putText(annotated_frame, f"S3 PASS  NCC={audit_score:.3f}",
                         (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-            log_lines.append(
-                "<span style='color: #ff3333; font-weight: bold;'>"
-                "【最终判决】: 高置信度告警 — 检测到疑似无人机射频信号！"
-                "</span>"
-            )
-        else:
-            log_lines.append("【最终判决】: 当前扇区无异常射频活动。")
+            # 注意：此处不输出"检测到无人机"文字，最终告警由 system_hub TPF 在二次确认后输出
 
         return annotated_frame, "\n".join(log_lines), alert_flag, alert_info
+
