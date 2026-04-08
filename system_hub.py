@@ -266,20 +266,21 @@ class CentralHubEngine(QObject):
                         # ── 分支 A：强信号直通 ──────────────────────────────────
                         self._rf_confirm_streak = self.RF_CONFIRM_REQUIRED  # 直接置满
                         self._rf_confirm_info   = rf_info
+                        # 中性措辞：说明"正在直通确认"而非"已检测到"
                         self.signal_log.emit(
-                            f"[TPF-BYPASS] 强信号直通！"
-                            f"NCC={score*100:.2f}% ≥ bypass_th={bypass_th*100:.2f}% "
-                            f"({self.RF_STRONG_BYPASS_RATIO:.1f}× th) "
-                            f"freq={freq_mhz:.0f}MHz")
+                            f"[RF-PRE] 强信号特征吻合，执行直通确认 "
+                            f"@ {freq_mhz:.0f} MHz  "
+                            f"NCC={score*100:.2f}%（≥ {bypass_th*100:.2f}% 旁路阈值）")
                     else:
                         # ── 分支 B：弱信号 2-tick 确认 ──────────────────────────
                         self._rf_confirm_streak += 1
                         self._rf_confirm_info    = rf_info
                         streak = self._rf_confirm_streak
+                        # 中性措辞：说明"射频特征吻合，等待二次确认"
                         self.signal_log.emit(
-                            f"[TPF] S3 确认 {streak}/{self.RF_CONFIRM_REQUIRED} tick "
-                            f"(freq={freq_mhz:.0f}MHz "
-                            f"score={score*100:.1f}% bypass_th={bypass_th*100:.1f}%)")
+                            f"[RF-PRE] 射频特征初步吻合 ({streak}/{self.RF_CONFIRM_REQUIRED})"
+                            f" @ {freq_mhz:.0f} MHz  "
+                            f"NCC={score*100:.1f}%  等待第 {self.RF_CONFIRM_REQUIRED} 次确认...")
 
                     if self._rf_confirm_streak >= self.RF_CONFIRM_REQUIRED:
                         # 达标（bypass 直通 或 累计确认）→ 发出最终告警
@@ -288,21 +289,28 @@ class CentralHubEngine(QObject):
                             "color":  "#e74c3c",
                             "alert":  True,
                         })
-                        freq  = self._rf_confirm_info.get("freq_mhz", 0.0)
-                        score_out = self._rf_confirm_info.get("score", 0.0)
+                        freq      = self._rf_confirm_info.get("freq_mhz", 0.0)
+                        score_out = self._rf_confirm_info.get("score",    0.0)
+                        # ── 最终确认：红色 HTML 告警行（醒目，放在所有过程日志之后）──
+                        self.signal_log.emit(
+                            f'<span style="color:#ef4444; font-weight:bold;">'
+                            f'⚠ [RF-ALARM] OcuSync 无人机信号已双重确认！'
+                            f' @ {freq:.0f} MHz  NCC={score_out*100:.2f}%'
+                            f' — 告警已入库，证据图像正在写入...</span>')
                         self._trigger_composite_save("SDR_OMNI_TRIGGER", freq, score_out)
                         # 不重置 streak，维持告警状态直到信号消失
                 else:
                     # ── 分支 C：S3 未通过，归零计数器 ──────────────────────────
                     if self._rf_confirm_streak > 0:
                         self.signal_log.emit(
-                            f"[TPF] 连续确认中断（streak 重置: "
-                            f"{self._rf_confirm_streak} → 0）")
+                            f"[RF-SCAN] 信号中断，射频特征确认计数重置 "
+                            f"({self._rf_confirm_streak} → 0)，继续扫描")
                     self._rf_confirm_streak = 0
                     self.signal_system_status.emit({
                         "system": f"系统状态: [扫描] ({rf_info.get('freq_mhz', 0):.0f}MHz)" if rf_info else "系统状态: 主管道全速扫描中...",
                         "color": "#27ae60"
                     })
+
             except Exception as e:
                 self.signal_log.emit(f"SDR 射频传感器寻址异常: {e}")
             finally:
