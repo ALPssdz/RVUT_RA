@@ -21,6 +21,78 @@ from vision_k230.k230_client import K230NetworkClient
 from ui_qt.gui_host import MainWindow
 from database.db_manager import DBManager
 
+
+# ==============================================================================
+# stdout/stderr 重定向器
+# 功能：将系统中所有 print() 输出路由到 GUI 日志框
+# 分两阶段工作：
+#   ① 预 GUI 阶段（hub 初始化期间）：存入内部缓冲区，并同步写入原 stdout
+#   ② GUI 就绪后：flush 缓冲区 + 直接 emit 到 signal_log
+# ==============================================================================
+class _GuiLogRedirector:
+    """
+    sys.stdout 重定向器：将 print() 输出路由至 Qt signal_log 信号。
+
+    使用方法：
+        redirector = _GuiLogRedirector()
+        sys.stdout = redirector
+        # ... 创建 hub / GUI ...
+        redirector.attach_signal(hub.signal_log.emit)
+    """
+
+    def __init__(self):
+        self._lock      = threading.Lock()
+        self._buf       = []           # 预 GUI 阶段缓冲区
+        self._emit_fn   = None         # GUI 就绪后的 signal.emit 函数
+        self._orig      = sys.__stdout__   # 保留原 stdout 用于 debug
+
+    def attach_signal(self, emit_fn):
+        """
+        绑定 Qt 信号 emit 函数，并将缓冲区内容 flush 至 GUI 日志框。
+        在 CentralHubEngine.__init__() 完成后（GUI 已构建）立即调用。
+        """
+        with self._lock:
+            self._emit_fn = emit_fn
+            for line in self._buf:
+                try:
+                    emit_fn(line)
+                except Exception:
+                    pass
+            self._buf.clear()
+
+    def write(self, text: str):
+        # 始终写入原 stdout（保留终端可见性）
+        if self._orig:
+            try:
+                self._orig.write(text)
+            except Exception:
+                pass
+
+        with self._lock:
+            # 按行切分，过滤纯空行避免日志框刷屏
+            for line in text.split('\n'):
+                stripped = line.rstrip()
+                if not stripped:
+                    continue
+                if self._emit_fn:
+                    try:
+                        self._emit_fn(stripped)
+                    except Exception:
+                        self._buf.append(stripped)
+                else:
+                    self._buf.append(stripped)
+
+    def flush(self):
+        if self._orig:
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+
+    def fileno(self):
+        """兼容需要 fd 的库（如 tqdm）"""
+        return self._orig.fileno() if self._orig else 1
+
 class CentralHubEngine(QObject):
     """
     系统级中央调度引擎（Central Orchestration Engine）
@@ -267,22 +339,50 @@ class CentralHubEngine(QObject):
         self.k230_client.stop()
 
 if __name__ == "__main__":
-    # ── 每次启动前自动测量环境底噪并更新 S3 阈值 ──────────────────────────────
-    print("[RF-Vision] 正在执行 S3 CAF-FFT 环境底噪自动校准...")
-    try:
-        from rf_zynq.calibrate_s3 import main as _calibrate
-        _calibrate()
-        print("[RF-Vision] 底噪校准完成，正在启动主系统...\n")
-    except Exception as _e:
-        print(f"[RF-Vision] 校准过程出错（{_e}），使用上次保存的阈值继续启动。\n")
+    # ── Step 1: 安装 stdout 重定向器 ──────────────────────────────────────────
+    # 在 QApplication 和 hub 创建之前安装，确保 RFToolchain 初始化期间的
+    # 所有 print() 输出（如 S3 阈值加载信息）都被捕获，最终显示在 GUI 日志框。
+    _redirector = _GuiLogRedirector()
+    sys.stdout  = _redirector
+    sys.stderr  = _redirector   # 同时捕获异常 traceback 与警告信息
 
+    # ── Step 2: 启动 Qt 应用与 Hub（GUI 优先弹出，不等待标定）────────────────
     app = QApplication(sys.argv)
-    hub = CentralHubEngine()
-    hub.ui_window.showFullScreen()
-    
+    hub = CentralHubEngine()       # 内部创建 MainWindow 及 RFToolchain
+                                   # 期间的 print() 进入 _redirector 缓冲区
+    hub.ui_window.showMaximized()  # 立即显示窗口，无需等待标定完成
+
+    # ── Step 3: 绑定信号，flush 缓冲区至 GUI 日志框 ───────────────────────────
+    # attach_signal 调用后，已缓冲的所有初始化日志立即出现在日志框，
+    # 后续任何 print() 也将实时路由到 GUI。
+    _redirector.attach_signal(hub.signal_log.emit)
+
+    # ── Step 4: 后台线程执行环境底噪校准（非阻塞，GUI 保持响应）─────────────
+    # 标定期间的所有 print() 经 _redirector 实时显示在系统事件日志框。
+    def _bg_calibrate():
+        hub.signal_log.emit("=" * 58)
+        hub.signal_log.emit("  [RF-Vision] 正在后台执行 S3 CAF-FFT 环境底噪校准...")
+        hub.signal_log.emit("  校准期间可正常操作界面，结果将实时显示于此日志框")
+        hub.signal_log.emit("=" * 58)
+        try:
+            from rf_zynq.calibrate_s3 import main as _calibrate
+            _calibrate()   # 内部所有 print() 已被 _redirector 捕获并实时显示
+            hub.signal_log.emit("  [RF-Vision] ✓ 底噪校准完成，新阈值已生效，系统就绪。")
+        except Exception as _e:
+            hub.signal_log.emit(f"  [RF-Vision] ⚠ 校准出错: {_e}")
+            hub.signal_log.emit("  → 将使用上次保存的阈值继续运行。")
+
+    threading.Thread(target=_bg_calibrate, daemon=True).start()
+
+    # ── Step 5: 进入 Qt 主事件循环 ───────────────────────────────────────────
     exit_code = app.exec_()
+
+    # ── Step 6: 恢复标准流并关闭子系统 ──────────────────────────────────────
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
     hub.shutdown()
     sys.exit(exit_code)
+
 
 # ==============================================================================
 # [DEBUG ONLY 临时隔离运行区块]: 关闭主控时自动清理历史调试污染数据
