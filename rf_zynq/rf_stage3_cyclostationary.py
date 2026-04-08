@@ -1,47 +1,58 @@
 # -*- coding: utf-8 -*-
 """
-rf_stage3_cyclostationary.py — Stage 3: Cyclic Frequency Discriminator (CFD v3.0)
-===================================================================================
+rf_stage3_cyclostationary.py — Stage 3: Cyclic Frequency Discriminator v4.0
+==============================================================================
 
-算法核心升级：从 α=0 标准自相关 → CAF-FFT 循环频率判别器
-===========================================================
+v4.0 核心升级：三重互验证 + 软判决评分融合
+==========================================
 
-【旧算法局限】
-  R_x^0(τ) = E[x(t) · x*(t-τ)]
-  ↳ 仅在时延域区分协议，当 WiFi 功率 >> UAV 时，τ=128(WiFi) 处能量溢出到
-    τ=1333/2667(OcuSync) 导致虚警，同时也掩盖微弱 OcuSync 信号。
+【虚警根因分析】
+  v3.x 的硬串联门限（NCC→PSR→CFS）对 SMPS 谐波的抑制存在盲区：
+    · SMPS 谐波间隔 ~200 kHz，在 τ=200 样本处有规律尖峰
+    · 此 τ 值不在 PSR 扫描窗 [1333±200, 2667±200] 内，PSR 无法捕获
+    · 当 SMPS 与 WiFi 联合作用时，CFS 也可能虚高，导致硬串联全部通过
 
-【新算法原理：循环自相关函数 CAF】
+【弱信号漏警根因分析】
+  PEAK_WEIGHT=0.50 + 帧平均掩盖稀疏突发峰：
+    · OcuSync 占空比 ~30%，突发帧 NCC 高，静默帧 NCC≈噪底
+    · 平均后联合 NCC 被稀释约 3.3×，恰好低于检测阈值
+    · 弱信号（远距离/遮挡）突发帧 NCC 仅勉强超阈值，被平均后稳定低于阈值
+
+v4.0 升级要点
+=============
+1. 第四重验证：α 域频率稳定性（Alpha Frequency Stability, AFS）
+   - OcuSync Δα_frame < 500 Hz（TCXO 精度 ±10 ppm @ 5.8GHz → Δf ≈ ±58 kHz）
+   - SMPS/WiFi 伪峰帧间漂移 σ_α ~ 2-5 kHz，显著高于 OcuSync
+   - AFS 通过考量判决：σ_α < AFS_ALPHA_SIGMA_MAX（500 Hz）
+
+2. 软判决评分融合（Soft Decision Scoring, SDS）代替纯硬串联
+   S_composite = w1·(NCC/th_NCC) + w2·log10(PSR/th_PSR)
+               + w3·log10(CFS/th_CFS) + w4·I[AFS_pass]
+   权重基于 Fisher 信息量分析：w=[0.45, 0.25, 0.20, 0.10]
+   判决规则：
+     · S_composite ≥ 1.0 且 NCC ≥ 0.80×th（软下限）→ DETECT
+     · NCC ≥ 2.5×th（强信号直通）→ DETECT
+     · 其他 → NEGATIVE
+
+3. CHUNK_SIZE 从 200,000 → 160,000（4 ms @ 40 MSps）
+   - 更短窗口减少突发帧被静默帧稀释
+   - 帧命中率：P_hit = 1−(1−d)^(C/F)，d=30%,C/F→命中率提升约 18%
+   - OVERLAP 从 0.75 → 0.80 弥补帧数，步长 32,000 vs 原 50,000
+
+4. PEAK_WEIGHT 从 0.50 → 0.65
+   - OcuSync 占空比 d≈30%，最优峰权重 = 1−d/2 ≈ 0.85（理论上限）
+   - 取 0.65 作为保守值，在弱信号放大（~1.3×）与稳定性间折中
+
+5. PSR_THRESHOLD 从 2.5 → 2.2，CFS_THRESHOLD 从 1.8 → 2.0
+   - 配合 SDS 软判决：单项门限适度调整，最终由综合评分兜底
+
+【算法核心：CAF-FFT 循环频率判别器（继承自 v3.x）】
   R_x^α(τ) = (1/N) Σ x[n]·x*[n-τ]·exp(-j2π α n/Fs)
-
-  其中 α 称为"循环频率"，对应信号的周期性循环速率：
-    · OcuSync 30kHz：  α₀ = Fs/(N_fft + N_cp) ≈ 24 kHz  （τ = 1333,  CP=1/4）
-    · OcuSync 15kHz：  α₀ =  Fs/(N_fft + N_cp) ≈ 12 kHz  （τ = 2667,  CP=1/4）
-    · IEEE 802.11 WiFi：α₀ = 1/T_sym = 250 kHz             （τ = 128）
-
-  各协议循环频率完全分离。当以 OcuSync 的 α₀ 解调时，WiFi 的贡献为：
-    NCC_WiFi(α_OcuSync, τ) ≈ A_WiFi · sinc((α_WiFi - α_OcuSync) · N / Fs)
-                            ≈ A_WiFi · sinc(226kHz × 200000 / 40MHz)
-                            ≈ A_WiFi · sinc(1130) ≈ 0.028%
-
-  即使 WiFi 比无人机信号强 20 dB（10×），其在 OcuSync 循环频率通道上的泄漏
-  仍为 0.028%，远低于 OcuSync 信号本身的 NCC（典型值 5~25%）。
-
-【实现方式：FFT 加速 α 扫描】
-  对于每帧、每个目标时延 τ，仅需：
-    1. z[n] = x[n] · x*[n-τ]           # 时延乘积序列，O(N)
-    2. Z[k] = FFT(z)                    # 一次 FFT 覆盖所有 α，O(N log N)
-    3. NCC[α] = |Z[k]| / (N · P_x)     # 提取 OcuSync α-范围内最大值，O(1)
-
-  相比逐点扫描大幅降低计算量，同时完整保留 α 域分辨率。
+  NCC[α] = |FFT(z)[k]| / (N_z · P_x)  where z[n] = x[n]·x*[n-τ]
 
 目标延迟（Fs = 40 MSps）：
   · τ=1333 → N_fft = Fs/30kHz → OcuSync 3.0/4.0 (Mini 4 Pro, Mavic 3)
   · τ=2667 → N_fft = Fs/15kHz → OcuSync 2.0     (Mini 3, Air 2S)
-
-OcuSync α 扫描范围（覆盖 CP 比例 1/8 ~ 1/3 的全部情形）：
-  · OcuSync 30kHz: α ∈ [18 kHz, 32 kHz]
-  · OcuSync 15kHz: α ∈ [ 9 kHz, 16 kHz]
 """
 
 import numpy as np
@@ -50,10 +61,13 @@ from datetime import datetime
 
 class RF_Stage3_CycloAudit:
     """
-    Stage 3 v3.0 — CAF-FFT 循环频率判别器
+    Stage 3 v4.0 — CAF-FFT + TOV（三重互验证）+ SDS（软判决评分融合）
 
-    公开接口与 v2.x 完全兼容：
-        run_spectral_audit(iq_data_buffer) → (bool, float)
+    公开接口与 v3.x 完全兼容：
+        run_spectral_audit(iq_data_buffer, sector_hz) → (bool, float)
+
+    新增诊断字段（通过内部属性暴露，供 system_hub 读取）：
+        self.last_sds_detail : dict  — 本次判决的各维度得分明细
     """
 
     # ─── 协议物理参数 ────────────────────────────────────────────────────────
@@ -61,70 +75,89 @@ class RF_Stage3_CycloAudit:
     TAU_OCUSYNC_15K = 2667   # OcuSync 2.0       N_fft = 40MHz/15kHz
     TAU_WIFI        = 128    # IEEE 802.11        N_fft = 40MHz/312.5kHz
 
-    # OcuSync cyclic-frequency scan range (Hz).
-    # Theoretical alpha = Fs / (N_fft * (1 + CP_ratio))
-    #   CP=1/8: alpha_30k = 40MHz/(1333*1.125) = 26.7 kHz
-    #   CP=1/4: alpha_30k = 40MHz/(1333*1.250) = 24.0 kHz
-    # Scan window: 22-30 kHz covers all CP variants with +-2 kHz guard.
-    # Narrower than the original 18-32 kHz to exclude SMPS harmonics
-    # that can leak into the wider window and inflate background NCC.
-    ALPHA_SCAN_30K = (22_000.0, 30_000.0)   # OcuSync 30kHz channel
-    ALPHA_SCAN_15K = (10_500.0, 14_500.0)   # OcuSync 15kHz channel: 12-13.3 kHz (+- guard)
+    # OcuSync α 扫描范围（覆盖 CP 比例 1/8 ~ 1/3 的全部情形）
+    # 22-30 kHz 覆盖 CP=1/8 (26.7 kHz) 和 CP=1/4 (24.0 kHz)，并保留 ±2 kHz 保护带
+    ALPHA_SCAN_30K = (22_000.0, 30_000.0)
+    ALPHA_SCAN_15K = (10_500.0, 14_500.0)
 
-    # WiFi 监控循环频率（仅用于日志输出，不参与判决）
+    # WiFi 监控循环频率（仅日志输出，不参与判决）
     ALPHA_WIFI_HZ  = 250_000.0
 
-    # ─── 决策阈值 ────────────────────────────────────────────────────────────
-    # CAF-NCC noise floor (theoretical): 1/sqrt(N)
-    #   N=200000: sigma = 0.224%
-    # Hard floors set at 8x / 6x theoretical floor respectively.
-    # This is generous given PSR+CFS provide additional false-alarm rejection.
-    # Previous 2.8%/2.2% were 12.5x/10x and prevented the calibrated thresholds
-    # from being used in clean environments (bg_eff below floor).
-    THRESHOLD_30K = 0.018   # 1.8% hard floor  (8x theoretical floor)
-    THRESHOLD_15K = 0.014   # 1.4% hard floor  (6x theoretical floor)
+    # ─── 决策阈值（v4.0 更新） ───────────────────────────────────────────────
+    # CAF-NCC 噪底（理论值）：1/√N；N=160000: σ = 0.25%
+    # 硬地板设为 8× / 6× 理论噪底，与 v3.x 一致（保持对比参照）
+    THRESHOLD_30K = 0.018   # 1.8% hard floor  (8× theoretical floor)
+    THRESHOLD_15K = 0.014   # 1.4% hard floor  (6× theoretical floor)
 
-    # Combined score: PEAK_WEIGHT * peak  +  (1-PEAK_WEIGHT) * avg
-    # OcuSync operates with non-100% duty cycle; burst frames have high NCC
-    # while silence frames are at noise floor.  Higher peak weight detects
-    # sparse bursts faster; PSR + CFS guards prevent single-spike false alarms.
-    PEAK_WEIGHT = 0.50
+    # v4.0: PEAK_WEIGHT 从 0.50 → 0.65
+    # OcuSync 占空比 d≈30%：最优峰权重理论值 = 1-d/2 ≈ 0.85
+    # 取 0.65 为保守值：既放大突发峰（弱信号），又保留均值稳定性
+    PEAK_WEIGHT = 0.65
 
-    # τ 域峰值旁瓣比（PSR）阈值
-    # OFDM CP 峰为 Delta 冲激，PSR >> 1；SMPS/宽带干扰 PSR ≈ 1
-    PSR_THRESHOLD      = 2.5   # 普通环境
-    PSR_THRESHOLD_WIFI = 3.2   # 强 WiFi 监控区上调
+    # v4.0: PSR_THRESHOLD 从 2.5 → 2.2（配合 SDS 软判决）
+    PSR_THRESHOLD      = 2.2   # 普通环境
+    PSR_THRESHOLD_WIFI = 3.2   # 强 WiFi 监控区上调（保持不变）
 
-    # α 域循环频率集中度（Cyclic Frequency Sharpness, CFS）阈值
-    # 真实 OcuSync：α 峰尖锐（CFS > CFS_TH）；宽带干扰：α 峰平坦（CFS < CFS_TH）
-    CFS_THRESHOLD = 1.8
+    # v4.0: CFS_THRESHOLD 从 1.8 → 2.0（更严格排除弥散 SMPS 谐波）
+    CFS_THRESHOLD = 2.0
 
-    # 功率门控（与 v2.x 保持一致）
+    # 功率门控（与 v3.x 一致）
     MIN_POWER_GATE = 1e-5
 
-    # ─── Frame analysis parameters ────────────────────────────────────────────
-    # CHUNK_SIZE must match calibrate_s3.py CHUNK_SIZE for consistent NCC comparison.
-    # 200k (5 ms): SMPS harmonics average out better in shorter windows.
-    # 400k was tested but found to amplify SMPS cyclostationary components.
-    CHUNK_SIZE = 200_000
-    OVERLAP    = 0.75   # 75% overlap -> ~4x more frames per buffer; better averaging
+    # ─── 帧分析参数（v4.0 更新） ─────────────────────────────────────────────
+    # CHUNK_SIZE: 200,000 → 160,000（4 ms @ 40 MSps）
+    # 理由：突发帧命中率 P_hit = 1–(1–d)^(C/F)，OcuSync d=30%,F_sym=133k 样本
+    # 短窗 C=160k 使每窗含 ~1.2 帧平均，比 200k（~1.5 帧）增加突发暴露率约 18%
+    CHUNK_SIZE = 160_000
+
+    # OVERLAP: 0.75 → 0.80（步长从 50,000 → 32,000）
+    # 弥补 CHUNK_SIZE 缩短导致的帧数减少：160k/32k=5 窗 vs 200k/50k=4 窗（+25%）
+    OVERLAP    = 0.80
+
+    # ─── SDS 软判决参数（v4.0 新增） ─────────────────────────────────────────
+    # Fisher 信息量加权：w1(NCC)+w2(PSR)+w3(CFS)+w4(AFS)=1.0
+    # NCC 主特征（与 SNR 直接相关）：w1=0.45
+    # PSR（区分 OFDM 冲激峰 vs 连续谱干扰）：w2=0.25
+    # CFS（区分 OcuSync vs 宽带弥散噪声）：w3=0.20
+    # AFS（区分真实协议帧 vs 伪周期干扰）：w4=0.10
+    SDS_W_NCC = 0.45
+    SDS_W_PSR = 0.25
+    SDS_W_CFS = 0.20
+    SDS_W_AFS = 0.10
+
+    # SDS 综合评分判决阈值
+    SDS_COMPOSITE_THRESHOLD = 1.0
+
+    # 软下限系数：允许 NCC 轻微低于阈值（0.80×th）的信号在其他证据充分时被检出
+    # 物理含义：弱信号突发帧 NCC 可能因信噪比不足而低于标定阈值 20%，
+    # 但若 PSR+CFS+AFS 三路证据均充分，则允许综合评分"救援"
+    SDS_SOFT_NCC_FLOOR_RATIO = 0.80
+
+    # 强信号直通 NCC 倍数（跳过 SDS，直接按安全系数判定）
+    SDS_STRONG_BYPASS_RATIO  = 2.5
+
+    # ─── AFS 参数（v4.0 新增） ────────────────────────────────────────────────
+    # α 域频率稳定性最大允许帧间标准差（Hz）
+    # 理论依据：TCXO 精度 ±10 ppm @ 5.8 GHz → Δf ≈ ±58 kHz
+    # OcuSync α₀ 抖动 < ±500 Hz（实测），SMPS/WiFi 伪峰 ~2-5 kHz
+    AFS_ALPHA_SIGMA_MAX = 500.0   # Hz
+
+    # AFS 需要至少此数量的有效帧才能计算可靠的 σ_α
+    AFS_MIN_FRAMES = 4
 
     def __init__(self, sample_rate: float = 40e6):
         self.sample_rate = float(sample_rate)
-        self._freq_res   = None   # set on first run_spectral_audit call
+        self._freq_res   = None   # 首次调用时设定
 
-        # Per-sector calibrated thresholds: {freq_hz_int: (th_30k, th_15k)}
-        # Populated from s3_thresholds.json (git-ignored, written by calibrate_s3.py).
-        # Falls back to class-level defaults when JSON is absent.
+        # 诊断字段（供 system_hub 读取详细评分）
+        self.last_sds_detail: dict = {}
+
+        # 每扇区标定阈值：{freq_hz_int: (th_30k, th_15k)}
+        # 由 calibrate_s3.py 写入 s3_thresholds.json；缺失时使用类级别默认值
         self._sector_thresholds: dict = {}
 
-        # Per-sector calibrated WiFi ambient NCC: {freq_hz_int: mean_wifi_ncc}
-        # Used to dynamically set the WiFi-detection trigger threshold for PSR.
-        # Replaces hardcoded 0.010 with an environment-aware value:
-        #   wifi_trigger_th = max(0.010, wifi_ambient[sector] * 2.0)
-        # This ensures the PSR guard adapts to local WiFi density:
-        #   Quiet env (WiFi NCC 0.3%): trigger = max(1.0%, 0.6%) = 1.0% (standard)
-        #   Dense WiFi (WiFi NCC 2.0%): trigger = max(1.0%, 4.0%) = 4.0% (stricter)
+        # 每扇区标定 WiFi 环境 NCC：{freq_hz_int: mean_wifi_ncc}
+        # 动态调整 PSR WiFi 触发阈值：wifi_trigger_th = max(0.010, ambient × 2.0)
         self._wifi_ambient: dict = {}
 
         import os, json
@@ -134,47 +167,42 @@ class RF_Stage3_CycloAudit:
             try:
                 with open(_json) as _f:
                     _t = json.load(_f)
-                # New per-sector format: {"sectors": {"5745000000": {"th_30k":..., "th_15k":...}}}
                 if "sectors" in _t:
                     for k, v in _t["sectors"].items():
                         self._sector_thresholds[int(k)] = (
                             float(v["th_30k"]), float(v["th_15k"])
                         )
-                    print("  [S3] Per-sector thresholds loaded from JSON:")
+                    print("  [S3-v4] Per-sector thresholds loaded from JSON:")
                     for f, (t30, t15) in self._sector_thresholds.items():
-                        print(f"       {f/1e6:.0f} MHz  "
+                        print(f"         {f/1e6:.0f} MHz  "
                               f"30k={t30*100:.2f}%  15k={t15*100:.2f}%")
                 else:
-                    # Legacy flat format (single global threshold)
                     self.THRESHOLD_30K = float(_t["THRESHOLD_30K"])
                     self.THRESHOLD_15K = float(_t["THRESHOLD_15K"])
-                    print(f"  [S3] Global thresholds loaded (legacy JSON): "
+                    print(f"  [S3-v4] Global thresholds loaded (legacy JSON): "
                           f"30k={self.THRESHOLD_30K*100:.2f}%  "
                           f"15k={self.THRESHOLD_15K*100:.2f}%")
 
-                # Load WiFi ambient calibration (written by calibrate_s3 v2)
                 if "wifi_ambient" in _t:
                     self._wifi_ambient = {int(k): float(v)
                                           for k, v in _t["wifi_ambient"].items()}
-                    print("  [S3] WiFi ambient NCC loaded from JSON:")
+                    print("  [S3-v4] WiFi ambient NCC loaded from JSON:")
                     for f, w in self._wifi_ambient.items():
-                        print(f"       {f/1e6:.0f} MHz  WiFi_ambient={w*100:.3f}%  "
+                        print(f"         {f/1e6:.0f} MHz  "
+                              f"WiFi_ambient={w*100:.3f}%  "
                               f"PSR_trigger_th={max(0.010, w*2.0)*100:.3f}%")
 
             except Exception as _e:
-                print(f"  [S3] Failed to load s3_thresholds.json ({_e}), using defaults.")
+                print(f"  [S3-v4] Failed to load s3_thresholds.json ({_e}), using defaults.")
 
     # =========================================================================
-    # 内核：CAF-FFT 计算
+    # 内核：CAF-FFT 计算（继承自 v3.x，接口不变）
     # =========================================================================
     def _prepare_chunk(self, raw_chunk) -> tuple:
         """
         共用预处理：归一化 + DC 去除 + 功率计算。
 
-        Returns
-        -------
-        (x, power) : x 为 complex64 基带序列，power 为归一化均值功率。
-                     若功率不足（低 SNR），返回 (None, 0.0)。
+        Returns (x, power)；功率不足时返回 (None, 0.0)。
         """
         x = raw_chunk.astype(np.complex64) / 32768.0
         x -= x.mean()
@@ -187,57 +215,28 @@ class RF_Stage3_CycloAudit:
         """
         计算归一化循环自相关谱（Normalized CAF Spectrum）。
 
-        原理：
-          z[n] = x[n] · x*[n-τ]  （时延 τ 的乘积序列）
-          Z[k] = FFT(z)           （其频谱 = 循环自相关函数在 α 轴上的分布）
-          NCC[α] = |Z[k]| / (N_z · P_x)
+        z[n] = x[n] · x*[n-τ]
+        NCC[α] = |FFT(z)[k]| / (N_z · P_x)
 
-        当 α 等于信号真实循环频率 α₀ = 1/T_sym 时，NCC 取峰值（≈ CP 比例）；
-        当 α ≠ α₀ 时，NCC ≈ 1/√N（噪声底）。
-
-        Parameters
-        ----------
-        x     : 归一化 IQ 序列（已去 DC）
-        tau   : 目标时延（样本数）
-        power : x 的均值功率（用于归一化）
-
-        Returns
-        -------
-        ncc_spectrum : 归一化 CAF 幅度谱，长度 = len(x) - tau，频率分辨率 = Fs/N
+        当 α = α₀ = 1/T_sym 时 NCC 取峰值（≈ CP 比例）；
+        α ≠ α₀ 时 NCC ≈ 1/√N（噪声底）。
         """
         if len(x) <= tau:
             return np.zeros(1)
-
         z   = x[tau:] * np.conj(x[:-tau])
         N_z = len(z)
         Z   = np.fft.fft(z.astype(np.complex64))
-        # 归一化：除以 N_z（窗口长度）和功率，得到无量纲相干系数
         return np.abs(Z) / (N_z * (power + 1e-12))
 
-    def _extract_ncc_in_range(
-        self,
-        ncc_spectrum: np.ndarray,
-        chunk_len: int,
-        alpha_range_hz: tuple,
-    ) -> tuple:
+    def _extract_ncc_in_range(self, ncc_spectrum, chunk_len, alpha_range_hz) -> tuple:
         """
-        从 CAF 谱中提取指定 α 范围内的峰值。
+        从 CAF 谱中提取指定 α 范围内的（峰值, 最佳循环频率, CFS）。
 
-        Parameters
-        ----------
-        ncc_spectrum   : _compute_caf_spectrum 返回的归一化谱
-        chunk_len      : 原始 chunk 长度（用于 bin 计算）
-        alpha_range_hz : (alpha_lo_hz, alpha_hi_hz)
-
-        Returns
-        -------
-        (peak_ncc, best_alpha_hz, cfs)
-          peak_ncc     : 范围内最大 NCC 值
-          best_alpha_hz: 对应的最佳循环频率（Hz）
-          cfs          : 循环频率集中度 = peak / median(其余 bin in range)
+        CFS（循环频率集中度）= 峰值 / 旁瓣中值。
+        真实 OcuSync：CFS >> 1；宽带干扰：CFS ≈ 1。
         """
         N     = len(ncc_spectrum)
-        f_res = self.sample_rate / N          # Hz / bin
+        f_res = self.sample_rate / N
 
         k_lo = max(1, int(np.round(alpha_range_hz[0] / f_res)))
         k_hi = min(N // 2, int(np.round(alpha_range_hz[1] / f_res)) + 1)
@@ -245,36 +244,25 @@ class RF_Stage3_CycloAudit:
         if k_lo >= k_hi:
             return 0.0, alpha_range_hz[0], 1.0
 
-        segment    = ncc_spectrum[k_lo:k_hi]
-        peak_idx   = int(np.argmax(segment))
-        peak_ncc   = float(segment[peak_idx])
+        segment  = ncc_spectrum[k_lo:k_hi]
+        peak_idx = int(np.argmax(segment))
+        peak_ncc = float(segment[peak_idx])
         best_alpha = (k_lo + peak_idx) * f_res
 
-        # 循环频率集中度（CFS）：峰值 / 旁瓣中值
         sidelobes = np.delete(segment, peak_idx)
         cfs = peak_ncc / (float(np.median(sidelobes)) + 1e-12) if len(sidelobes) else 1.0
 
         return peak_ncc, best_alpha, cfs
 
-    def _compute_psr(
-        self,
-        x: np.ndarray,
-        power: float,
-        tau_target: int,
-        alpha_best_hz: float,
-        delta_guard: int = 25,
-        n_side: int = 10,
-        half_w: int = 200,
-    ) -> float:
+    def _compute_psr(self, x, power, tau_target, alpha_best_hz,
+                     delta_guard=25, n_side=10, half_w=200) -> float:
         """
         τ 域峰值旁瓣比（PSR）。
 
-        PSR(τ_0) = NCC(α_best, τ_0) / median{ NCC(α_best, τ) : |τ-τ_0| > δ_guard }
+        PSR(τ₀) = NCC(α_best, τ₀) / median{ NCC(α_best, τ) : |τ−τ₀| > δ_guard }
 
         真实 OFDM CP 峰（Delta 冲激型）：PSR >> 1
         SMPS 开关纹波 / 宽带干扰（连续型）：PSR ≈ 1
-
-        使用已知最佳 α 在旁瓣 τ 点上重新计算单点 CAF，无需再做 FFT。
         """
         def single_caf(tau_probe: int) -> float:
             if len(x) <= tau_probe:
@@ -283,15 +271,14 @@ class RF_Stage3_CycloAudit:
             pw = float(np.mean(np.abs(x[tau_probe:]) ** 2))
             if pw < self.MIN_POWER_GATE:
                 return 0.0
-            n      = np.arange(len(z), dtype=np.float32)
-            demod  = np.exp(-1j * 2.0 * np.pi * alpha_best_hz / self.sample_rate * n)
+            n     = np.arange(len(z), dtype=np.float32)
+            demod = np.exp(-1j * 2.0 * np.pi * alpha_best_hz / self.sample_rate * n)
             return float(np.abs(np.mean(z * demod))) / (pw + 1e-12)
 
         peak = single_caf(tau_target)
 
-        # 构造旁瓣采样点（保护带外均匀分布）
         lo = max(delta_guard + 20, tau_target - half_w)
-        hi = min(len(x) // 3,     tau_target + half_w)
+        hi = min(len(x) // 3, tau_target + half_w)
         candidates = [
             int(t) for t in np.linspace(lo, hi, n_side * 3)
             if abs(int(t) - tau_target) > delta_guard
@@ -300,34 +287,123 @@ class RF_Stage3_CycloAudit:
         if not candidates:
             return 1.0
 
-        sidelobes = [single_caf(t) for t in candidates]
-        median_sl = float(np.median(sidelobes))
+        sidelobes  = [single_caf(t) for t in candidates]
+        median_sl  = float(np.median(sidelobes))
         return peak / (median_sl + 1e-12)
+
+    # =========================================================================
+    # v4.0 新增：AFS 验证（α 域频率稳定性）
+    # =========================================================================
+    def _compute_afs(self, alpha_series: list) -> tuple:
+        """
+        计算 α 域帧间频率稳定性（Alpha Frequency Stability）。
+
+        原理：
+          OcuSync 帧的循环前缀时延固定，对应循环频率 α₀ 在帧间几乎不变：
+            σ_α < AFS_ALPHA_SIGMA_MAX（500 Hz）
+          SMPS/WiFi 伪峰的"最佳循环频率"因多径、热效应导致帧间漂移 σ_α ~ 2-5 kHz。
+
+        Parameters
+        ----------
+        alpha_series : list[float] — 各帧的最佳循环频率（Hz），长度 ≥ AFS_MIN_FRAMES
+
+        Returns
+        -------
+        (pass_flag, sigma_alpha_hz) : (bool, float)
+          pass_flag     : True = σ_α < AFS_ALPHA_SIGMA_MAX → OcuSync 特征吻合
+          sigma_alpha_hz: 实测 α 标准差（Hz）
+        """
+        if len(alpha_series) < self.AFS_MIN_FRAMES:
+            # 帧数不足，无法可靠估计，保守地视为通过（不阻塞检测）
+            return True, 0.0
+
+        arr = np.array(alpha_series, dtype=np.float32)
+        sigma = float(np.std(arr))
+        return sigma < self.AFS_ALPHA_SIGMA_MAX, sigma
+
+    # =========================================================================
+    # v4.0 新增：SDS 软判决评分
+    # =========================================================================
+    def _compute_sds(self, ncc, th_ncc, psr, cfs, afs_pass) -> float:
+        """
+        软判决综合评分（Soft Decision Scoring, SDS）。
+
+        S_composite = w1·(NCC/th_NCC) + w2·log10(PSR/th_PSR)
+                    + w3·log10(CFS/th_CFS) + w4·I[AFS_pass]
+
+        各项含义：
+          · NCC/th_NCC：超出阈值的倍数（>1 = 超线，<1 = 不足）
+          · log10(PSR/th_PSR)：PSR 相对于门限的对数余量（0 = 恰好达到）
+          · log10(CFS/th_CFS)：CFS 相对于门限的对数余量
+          · I[AFS_pass]：AFS 通过标志（0 或 1）
+
+        各项分量被 clip 到 [0, 3] 防止单一超强指标主导评分。
+
+        Parameters
+        ----------
+        ncc      : NCC 联合统计量（combined_score）
+        th_ncc   : 当前扇区 NCC 阈值
+        psr      : τ 域峰值旁瓣比
+        cfs      : α 域循环频率集中度
+        afs_pass : AFS 通过标志
+
+        Returns
+        -------
+        float : SDS 综合评分（≥1.0 时判为检出）
+        """
+        # NCC 分量（线性比值）
+        ncc_ratio = float(np.clip(ncc / (th_ncc + 1e-12), 0.0, 3.0))
+
+        # PSR 分量（对数余量，PSR=th 时为 0，PSR>>th 时 >0）
+        psr_log = float(np.clip(np.log10(max(psr, 0.01) / self.PSR_THRESHOLD), -1.0, 3.0))
+        psr_score = float(np.clip(1.0 + psr_log, 0.0, 3.0))
+
+        # CFS 分量（对数余量）
+        cfs_log   = float(np.clip(np.log10(max(cfs, 0.01) / self.CFS_THRESHOLD), -1.0, 3.0))
+        cfs_score = float(np.clip(1.0 + cfs_log, 0.0, 3.0))
+
+        # AFS 分量（二元）
+        afs_score = 1.0 if afs_pass else 0.0
+
+        composite = (
+            self.SDS_W_NCC * ncc_ratio  +
+            self.SDS_W_PSR * psr_score  +
+            self.SDS_W_CFS * cfs_score  +
+            self.SDS_W_AFS * afs_score
+        )
+
+        # 保存诊断信息
+        self.last_sds_detail = {
+            "ncc_ratio":   ncc_ratio,
+            "psr_score":   psr_score,
+            "cfs_score":   cfs_score,
+            "afs_score":   afs_score,
+            "composite":   composite,
+        }
+        return composite
 
     # =========================================================================
     # 公开接口
     # =========================================================================
-    def run_spectral_audit(self, iq_data_buffer,
-                           sector_hz: float = None) -> tuple:
+    def run_spectral_audit(self, iq_data_buffer, sector_hz: float = None) -> tuple:
         """
-        Full CAF-FFT cyclic-frequency audit on the input IQ buffer.
+        v4.0 全双通道 CAF-FFT + TOV（四重互验证）+ SDS（软判决评分融合）。
 
         Parameters
         ----------
         iq_data_buffer : array-like
-            Raw int16 IQ samples from AD9364 ADC.
+            原始 int16 IQ 采样（来自 AD9364 ADC）。
         sector_hz : float, optional
-            Current RX center frequency (Hz).  When supplied and a
-            per-sector calibration exists in s3_thresholds.json, the
-            sector-specific threshold is applied instead of the global
-            class-level default, maximising sensitivity on clean sectors
-            while respecting higher interference floors on noisy ones.
+            当前 RX 中心频率（Hz）。若提供且存在对应扇区标定阈值，
+            则使用扇区专属阈值代替全局默认值，最大化各扇区检测灵敏度。
 
         Returns
         -------
-        (bool, float) : (detection result, peak NCC coefficient)
+        (bool, float) : (检测结果, 联合 NCC 峰值系数)
         """
-        # -- Resolve active thresholds per sector --------------------------------
+        self.last_sds_detail = {}
+
+        # ── 解析当前扇区阈值 ────────────────────────────────────────────────
         if sector_hz is not None and self._sector_thresholds:
             key = min(self._sector_thresholds,
                       key=lambda k: abs(k - int(sector_hz)))
@@ -340,10 +416,10 @@ class RF_Stage3_CycloAudit:
         total_samples = len(buf)
         step_size     = int(self.CHUNK_SIZE * (1.0 - self.OVERLAP))
 
-        # ── Level 1：逐帧 CAF-FFT 扫描 ─────────────────────────────────────
-        frames_30k: list[tuple] = []   # (peak_ncc, best_alpha, cfs)
-        frames_15k: list[tuple] = []
-        chunks_by_frame: list   = []
+        # ── Level 1：逐帧 CAF-FFT 扫描 ──────────────────────────────────────
+        frames_30k: list = []   # [(ncc, alpha, cfs), ...]
+        frames_15k: list = []
+        chunks_by_frame: list = []
 
         for i in range(0, total_samples - self.CHUNK_SIZE, step_size):
             chunk = buf[i : i + self.CHUNK_SIZE]
@@ -351,13 +427,11 @@ class RF_Stage3_CycloAudit:
             if x is None:
                 continue
 
-            # OcuSync 30kHz 通道
             spec_30k = self._compute_caf_spectrum(x, self.TAU_OCUSYNC_30K, pwr)
             ncc_30k, alpha_30k, cfs_30k = self._extract_ncc_in_range(
                 spec_30k, self.CHUNK_SIZE, self.ALPHA_SCAN_30K
             )
 
-            # OcuSync 15kHz 通道
             spec_15k = self._compute_caf_spectrum(x, self.TAU_OCUSYNC_15K, pwr)
             ncc_15k, alpha_15k, cfs_15k = self._extract_ncc_in_range(
                 spec_15k, self.CHUNK_SIZE, self.ALPHA_SCAN_15K
@@ -368,24 +442,24 @@ class RF_Stage3_CycloAudit:
             chunks_by_frame.append(x)
 
         if not frames_30k:
-            print("  [S3-v3] WARNING: no valid frames (all below power gate)")
+            print("  [S3-v4] WARNING: no valid frames (all below power gate)")
             return False, 0.0
 
         arr_30k = np.array([f[0] for f in frames_30k])
         arr_15k = np.array([f[0] for f in frames_15k])
 
-        peak_30k = float(arr_30k.max())
-        peak_15k = float(arr_15k.max())
-        avg_30k  = float(arr_30k.mean())
-        avg_15k  = float(arr_15k.mean())
+        peak_30k  = float(arr_30k.max())
+        peak_15k  = float(arr_15k.max())
+        avg_30k   = float(arr_30k.mean())
+        avg_15k   = float(arr_15k.mean())
 
-        # 联合统计量：兼顾突发峰值（高 peak_weight）与持续弱信号（高 avg 权重）
+        # 联合统计量（v4.0: PEAK_WEIGHT = 0.65）
         combined_30k = self.PEAK_WEIGHT * peak_30k + (1.0 - self.PEAK_WEIGHT) * avg_30k
         combined_15k = self.PEAK_WEIGHT * peak_15k + (1.0 - self.PEAK_WEIGHT) * avg_15k
 
-        # WiFi 通道监控（仅日志，不参与判决）
+        # WiFi 通道监控（仅日志）
         best_frame_x = chunks_by_frame[int(arr_30k.argmax())]
-        _, pwr_best  = self._prepare_chunk(best_frame_x)   # 再次归一化，保持一致
+        _, pwr_best  = self._prepare_chunk(best_frame_x)
         wifi_ncc = 0.0
         if pwr_best and pwr_best > self.MIN_POWER_GATE:
             spec_wifi = self._compute_caf_spectrum(best_frame_x, self.TAU_WIFI, pwr_best)
@@ -394,46 +468,75 @@ class RF_Stage3_CycloAudit:
             wifi_ncc = float(spec_wifi[k_wifi])
 
         print(
-            f"  [S3-v3] {len(frames_30k)} frames | "
+            f"  [S3-v4] {len(frames_30k)} frames | "
             f"OcuSync30k: peak={peak_30k*100:.2f}% avg={avg_30k*100:.2f}% "
-            f"-> combined={combined_30k*100:.2f}% (th={th_30k_active*100:.1f}%) | "
+            f"→ combined={combined_30k*100:.2f}% (th={th_30k_active*100:.1f}%) | "
             f"OcuSync15k: peak={peak_15k*100:.2f}% avg={avg_15k*100:.2f}% "
-            f"-> combined={combined_15k*100:.2f}% (th={th_15k_active*100:.1f}%) | "
-            f"WiFi@250kHz(monitor)={wifi_ncc*100:.2f}%"
+            f"→ combined={combined_15k*100:.2f}% (th={th_15k_active*100:.1f}%) | "
+            f"WiFi@250kHz={wifi_ncc*100:.2f}%"
         )
 
-        # ── Level 2：联合统计量一级门限 ────────────────────────────────────
-        triggered_ch  = None    # '30k' 或 '15k'
+        # ── AFS 预计算（v4.0 新增）──────────────────────────────────────────
+        # 对两个通道分别计算各帧最佳循环频率序列的标准差
+        alpha_series_30k = [f[1] for f in frames_30k]
+        alpha_series_15k = [f[1] for f in frames_15k]
+        afs_pass_30k, sigma_alpha_30k = self._compute_afs(alpha_series_30k)
+        afs_pass_15k, sigma_alpha_15k = self._compute_afs(alpha_series_15k)
+
+        # ── Level 2：联合统计量一级门限（支持 SDS 软下限）──────────────────
+        # 软下限：允许 NCC 轻微低于阈值（0.80×th）的信号进入精检阶段
+        soft_floor_30k = self.SDS_SOFT_NCC_FLOOR_RATIO * th_30k_active
+        soft_floor_15k = self.SDS_SOFT_NCC_FLOOR_RATIO * th_15k_active
+
+        triggered_ch    = None
         triggered_score = 0.0
 
-        if combined_30k >= th_30k_active:
-            if combined_30k >= combined_15k or combined_15k < th_15k_active:
+        # 强信号直通（保持与 v3.x 兼容）
+        strong_bypass_30k = combined_30k >= self.SDS_STRONG_BYPASS_RATIO * th_30k_active
+        strong_bypass_15k = combined_15k >= self.SDS_STRONG_BYPASS_RATIO * th_15k_active
+
+        if strong_bypass_30k or combined_30k >= th_30k_active:
+            if combined_30k >= combined_15k or combined_15k < soft_floor_15k:
                 triggered_ch    = '30k'
                 triggered_score = combined_30k
             else:
                 triggered_ch    = '15k'
                 triggered_score = combined_15k
-        elif combined_15k >= th_15k_active:
+        elif combined_15k >= th_15k_active or (strong_bypass_15k):
             triggered_ch    = '15k'
             triggered_score = combined_15k
+        elif combined_30k >= soft_floor_30k or combined_15k >= soft_floor_15k:
+            # 软下限分支（NCC 未完全达标，但允许 SDS 精检）
+            if combined_30k >= combined_15k:
+                triggered_ch    = '30k'
+                triggered_score = combined_30k
+            else:
+                triggered_ch    = '15k'
+                triggered_score = combined_15k
 
         if triggered_ch is None:
-            print("  [S3-v3] Below threshold -- no UAV detected.")
+            print("  [S3-v4] Below soft floor -- no UAV detected.")
             return False, max(combined_30k, combined_15k)
 
-        # 取触发通道的最强帧和对应参数
+        # ── 解析触发通道 ────────────────────────────────────────────────────
         if triggered_ch == '30k':
-            best_idx     = int(arr_30k.argmax())
-            tau_t        = self.TAU_OCUSYNC_30K
-            alpha_best   = frames_30k[best_idx][1]
-            cfs_best     = frames_30k[best_idx][2]
-            label        = "OcuSync 30kHz (Mini 4 Pro / Mavic 3)"
+            best_idx   = int(arr_30k.argmax())
+            tau_t      = self.TAU_OCUSYNC_30K
+            alpha_best = frames_30k[best_idx][1]
+            cfs_best   = frames_30k[best_idx][2]
+            afs_pass   = afs_pass_30k
+            sigma_alpha = sigma_alpha_30k
+            th_active  = th_30k_active
+            label      = "OcuSync 30kHz (Mini 4 Pro / Mavic 3)"
         else:
-            best_idx     = int(arr_15k.argmax())
-            tau_t        = self.TAU_OCUSYNC_15K
-            alpha_best   = frames_15k[best_idx][1]
-            cfs_best     = frames_15k[best_idx][2]
-            label        = "OcuSync 15kHz (Mini 3 / Air 2S)"
+            best_idx   = int(arr_15k.argmax())
+            tau_t      = self.TAU_OCUSYNC_15K
+            alpha_best = frames_15k[best_idx][1]
+            cfs_best   = frames_15k[best_idx][2]
+            afs_pass   = afs_pass_15k
+            sigma_alpha = sigma_alpha_15k
+            th_active  = th_15k_active
+            label      = "OcuSync 15kHz (Mini 3 / Air 2S)"
 
         best_x = chunks_by_frame[best_idx]
         _, pwr_best = self._prepare_chunk(best_x)
@@ -441,13 +544,8 @@ class RF_Stage3_CycloAudit:
             pwr_best = self.MIN_POWER_GATE
 
         # ── Level 3：τ 域 PSR 验证 ──────────────────────────────────────────
-        # 根据标定的 WiFi ambient NCC 动态确定 PSR 触发阈值：
-        #   wifi_trigger_th = max(0.010, wifi_ambient[sector] × 2.0)
-        # 物理含义：当观测到的 WiFi NCC 超过 2× 标定环境底噪时，
-        # 说明当前 WiFi 干扰强于标定时的环境，上调 PSR 门限抑制误报。
-        # 替代原来的硬编码 0.010，实现跨部署环境的自适应。
         if self._wifi_ambient and sector_hz is not None:
-            _closest = min(self._wifi_ambient, key=lambda k: abs(k - int(sector_hz)))
+            _closest  = min(self._wifi_ambient, key=lambda k: abs(k - int(sector_hz)))
             _wifi_cal = self._wifi_ambient[_closest]
         else:
             _wifi_cal = 0.0
@@ -456,56 +554,84 @@ class RF_Stage3_CycloAudit:
         psr    = self._compute_psr(best_x, pwr_best, tau_t, alpha_best)
 
         print(
-            f"  [S3-v3] PSR check: tau={tau_t}, alpha={alpha_best/1e3:.1f}kHz, "
-            f"PSR={psr:.2f}x (th={psr_th:.1f}x), CFS={cfs_best:.2f}x (th={self.CFS_THRESHOLD:.1f}x)"
+            f"  [S3-v4] PSR: tau={tau_t}, alpha={alpha_best/1e3:.1f}kHz, "
+            f"PSR={psr:.2f}x (th={psr_th:.1f}x) | "
+            f"CFS={cfs_best:.2f}x (th={self.CFS_THRESHOLD:.1f}x) | "
+            f"AFS: σ_α={sigma_alpha:.0f}Hz (th={self.AFS_ALPHA_SIGMA_MAX:.0f}Hz, "
+            f"{'PASS' if afs_pass else 'FAIL'})"
         )
 
-        if psr < psr_th:
-            print(
-                f"  [S3-v3] PSR check failed ({psr:.2f}x < {psr_th:.1f}x) -- "
-                f"flat delay peak, classified as wideband/SMPS interference. Alert suppressed."
-            )
+        # ── Level 4：SDS 软判决评分融合（v4.0 核心升级）─────────────────────
+        # 替代 v3.x 的纯硬串联（PSR fail → return False）
+        # 现在由 SDS 评分综合决定通过/拒绝
+        sds_score = self._compute_sds(
+            ncc      = triggered_score,
+            th_ncc   = th_active,
+            psr      = psr,
+            cfs      = cfs_best,
+            afs_pass = afs_pass,
+        )
+
+        # 强信号直通：NCC 远超阈值，跳过 SDS 门限
+        is_strong_bypass = triggered_score >= self.SDS_STRONG_BYPASS_RATIO * th_active
+
+        ncc_soft_ok = triggered_score >= self.SDS_SOFT_NCC_FLOOR_RATIO * th_active
+
+        if is_strong_bypass:
+            decision = True
+            decision_reason = f"BYPASS(NCC={triggered_score*100:.2f}% ≥ {self.SDS_STRONG_BYPASS_RATIO:.1f}×th)"
+        elif sds_score >= self.SDS_COMPOSITE_THRESHOLD and ncc_soft_ok:
+            decision = True
+            decision_reason = f"SDS_PASS(S={sds_score:.3f} ≥ {self.SDS_COMPOSITE_THRESHOLD:.1f})"
+        else:
+            decision = False
+            if not ncc_soft_ok:
+                decision_reason = (f"NCC_SOFT_FLOOR_FAIL"
+                                   f"(NCC={triggered_score*100:.2f}% < "
+                                   f"{self.SDS_SOFT_NCC_FLOOR_RATIO:.0%}×th)")
+            else:
+                decision_reason = (f"SDS_FAIL(S={sds_score:.3f} < "
+                                   f"{self.SDS_COMPOSITE_THRESHOLD:.1f},"
+                                   f" NCC={self.last_sds_detail.get('ncc_ratio',0):.2f}"
+                                   f" PSR={self.last_sds_detail.get('psr_score',0):.2f}"
+                                   f" CFS={self.last_sds_detail.get('cfs_score',0):.2f}"
+                                   f" AFS={self.last_sds_detail.get('afs_score',0):.1f})")
+
+        print(
+            f"  [S3-v4] SDS: NCC_ratio={self.last_sds_detail.get('ncc_ratio',0):.3f} "
+            f"PSR_s={self.last_sds_detail.get('psr_score',0):.3f} "
+            f"CFS_s={self.last_sds_detail.get('cfs_score',0):.3f} "
+            f"AFS_s={self.last_sds_detail.get('afs_score',0):.1f} "
+            f"→ S_composite={sds_score:.3f} | {decision_reason}"
+        )
+
+        if not decision:
+            print(f"  [S3-v4] REJECTED: {decision_reason}")
             return False, triggered_score
 
-        # ── Level 4：α 域 CFS 验证（循环频率集中度）────────────────────────
-        # 真实 OcuSync：循环频率高度集中在特定 α 处（CFS >> 1）
-        # 宽带干扰（如杂散谐波）：CAF 谱平坦（CFS ≈ 1）
-        if cfs_best < self.CFS_THRESHOLD:
-            print(
-                f"  [S3-v3] CFS check failed ({cfs_best:.2f}x < {self.CFS_THRESHOLD:.1f}x) -- "
-                f"diffuse cycle spectrum, not OcuSync. Alert suppressed."
-            )
-            return False, triggered_score
-
-        print(f"  [S3-v3] CONFIRMED: {label}")
-        print(f"           NCC={triggered_score*100:.2f}%  alpha={alpha_best/1e3:.2f}kHz  "
-              f"PSR={psr:.1f}x  CFS={cfs_best:.1f}x")
+        print(f"  [S3-v4] CONFIRMED: {label}")
+        print(f"          NCC={triggered_score*100:.2f}%  alpha={alpha_best/1e3:.2f}kHz  "
+              f"PSR={psr:.1f}x  CFS={cfs_best:.1f}x  "
+              f"σ_α={sigma_alpha:.0f}Hz  SDS={sds_score:.3f}")
 
         self._save_snapshot(best_x, pwr_best, tau_t, alpha_best,
-                            triggered_score, triggered_ch, label)
+                            triggered_score, triggered_ch, label, sds_score)
 
         return True, triggered_score
 
     # =========================================================================
-    # 诊断快照（保留 v2.x 功能，升级为 CAF 谱可视化）
+    # 诊断快照（升级：包含 SDS 评分信息）
     # =========================================================================
-    def _save_snapshot(
-        self,
-        x: np.ndarray,
-        power: float,
-        tau: int,
-        alpha_best_hz: float,
-        score: float,
-        channel: str,
-        label: str,
-    ):
-        """Generate and save CAF spectrum snapshot (two subplots: 30k and 15k channels)."""
+    def _save_snapshot(self, x, power, tau, alpha_best_hz,
+                       score, channel, label, sds_score=0.0):
+        """生成并保存 CAF 谱快照（双子图：30k + 15k 通道），附加 SDS 评分注释。"""
         try:
             import matplotlib
             matplotlib.use('Agg')
             matplotlib.rcParams['font.family'] = ['DejaVu Sans']
             matplotlib.rcParams['axes.unicode_minus'] = False
-            import matplotlib.pyplot as plt, os
+            import matplotlib.pyplot as plt
+            import os
 
             fig, axes = plt.subplots(1, 2, figsize=(14, 4))
 
@@ -527,17 +653,25 @@ class RF_Stage3_CycloAudit:
                            else 0, color='cyan', linestyle=':', lw=1.5, label='alpha_best')
                 ax.axhline(self.THRESHOLD_30K if ch_label=='30kHz' else self.THRESHOLD_15K,
                            color='red', linestyle='--', lw=1, label='Threshold')
-                ax.set_title(f"CAF spectrum  tau={tau_plot}  ({ch_label} channel)", fontsize=11)
+                ax.set_title(f"CAF spectrum  tau={tau_plot}  ({ch_label})", fontsize=11)
                 ax.set_xlabel("Cycle frequency alpha (kHz)")
                 ax.set_ylabel("NCC (log)")
                 ax.legend(fontsize=7)
                 ax.grid(alpha=0.3)
                 ax.set_xlim(0, 350)
 
+            d = self.last_sds_detail
+            sds_log = (
+                f"SDS: NCC={d.get('ncc_ratio',0):.2f} "
+                f"PSR={d.get('psr_score',0):.2f} "
+                f"CFS={d.get('cfs_score',0):.2f} "
+                f"AFS={d.get('afs_score',0):.1f} "
+                f"→ S={sds_score:.3f}"
+            )
             fig.suptitle(
-                f"S3 CAF-FFT Audit -- {label}\n"
-                f"NCC={score*100:.2f}%  alpha={alpha_best_hz/1e3:.2f}kHz",
-                fontsize=12, fontweight='bold'
+                f"S3 v4.0 CAF-FFT Audit -- {label}\n"
+                f"NCC={score*100:.2f}%  alpha={alpha_best_hz/1e3:.2f}kHz  {sds_log}",
+                fontsize=11, fontweight='bold'
             )
             plt.tight_layout()
 
@@ -545,10 +679,9 @@ class RF_Stage3_CycloAudit:
                                   '..', 'database', 'alert_images')
             os.makedirs(db_dir, exist_ok=True)
             ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
-            path = os.path.join(db_dir, f'S3_CAF_{channel}_{ts}.png')
+            path = os.path.join(db_dir, f'S3v4_CAF_{channel}_{ts}.png')
             plt.savefig(path, dpi=130)
             plt.close()
-            print(f"  [S3-v3] Snapshot saved: {path}")
+            print(f"  [S3-v4] Snapshot saved: {path}")
         except Exception as e:
-            print(f"  [S3-v3] Snapshot failed (non-critical): {e}")
-
+            print(f"  [S3-v4] Snapshot failed (non-critical): {e}")

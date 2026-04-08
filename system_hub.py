@@ -130,21 +130,38 @@ class CentralHubEngine(QObject):
         self._master_thread = None
         self._tick_lock     = threading.Lock()  # 防止 tick() 在 stop/start 切换时重入
 
-        # ── 时序持久化滤波器（Temporal Persistence Filter v2）───────────────────
-        # 自适应 bypass 机制：
-        #   强信号（score ≥ bypass_th）：单 tick 直通，0 延迟
-        #   普通信号（th ≤ score < bypass_th）：2-tick 确认
-        #   噪声（score < th）：streak 重置
+        # ── 时序持久化滤波器 v4.0（Tri-Level Elastic Confirmation TPF）──────────
         #
-        # 虚警率模型（弱信号分支）：P_fa_final = P_fa_tick^N
-        #   N=2, P_fa_tick=5% → P_fa_final = 0.25%
-        # 强信号旁路条件（单 tick）：
-        #   score ≥ BYPASS_RATIO × th ≈ 6~12%（典型 OcuSync 近场 NCC 8~25%）
-        #   在此 NCC 量级下，PSR+CFS 双重门限已保证 Pfa < 0.1%，TPF 无需介入
-        self._rf_confirm_streak   = 0
-        self._rf_confirm_info     = {}    # 缓存最近一次有效告警信息
-        self.RF_CONFIRM_REQUIRED  = 2     # 弱信号分支：连续 2 tick 才入库报警
-        self.RF_STRONG_BYPASS_RATIO = 3.0 # 强信号旁路：score ≥ 3× 阈值时单 tick 直通
+        # 三级弹性确认窗口（N_confirm 动态由 SDS 得分区间决定）：
+        #   强信号（score ≥ BYPASS_RATIO × th）：N=1，单 tick 直通
+        #   中等信号（MED_RATIO × th ≤ score < BYPASS_RATIO × th）：N=2，快速确认
+        #   弱信号（th ≤ score < MED_RATIO × th）：N=3，严格确认
+        #
+        # 虚警率模型：P_fa_final = P_fa_tick^N
+        #   N=1（强）: 由 AFS+PSR+CFS 联合保证 Pfa < 0.1%
+        #   N=2（中）: P_fa = 0.05² = 0.25%
+        #   N=3（弱）: P_fa = 0.05³ = 0.0125%
+        #
+        # streak 衰减机制（v4.0 新增，替代归零）：
+        #   信号消失后 streak 不立即归零，而是按 delta_decay=0.5/tick 线性衰减
+        #   streak[t+1] = max(0, streak[t] - delta_decay)
+        #   物理含义：信号短暂中断后 2 tick 内重现无需重新积累，降低探测延迟
+        self._rf_confirm_streak     = 0.0  # v4.0: 改为 float 以支持小数衰减
+        self._rf_confirm_info       = {}   # 缓存最近一次有效告警信息
+        self.RF_CONFIRM_REQUIRED    = 3    # 弱信号分支：连续 3 tick 才入库报警
+        self.RF_STRONG_BYPASS_RATIO = 3.0  # 强信号：score ≥ 3×th → N=1 直通
+        self.RF_MED_BYPASS_RATIO    = 1.8  # 中等信号：score ≥ 1.8×th → N=2 快速确认
+        self.RF_STREAK_DECAY        = 0.5  # 每 tick 衰减量（信号中断时）
+        #
+        # YOLO 补充分注入（v4.0 新增）：
+        #   当 S3 SDS 得分在 [SDS_RESCUE_LO, SDS_RESCUE_HI) 区间（接近但未达阈值）
+        #   且 YOLO bbox_score ≥ YOLO_INJ_THRESH 时，向 SDS 分注入 YOLO_INJ_WEIGHT
+        #   最终判决：S_final = S_sds + YOLO_INJ_WEIGHT（若满足注入条件）
+        #   注意：YOLO 单独不触发任何告警，仅作为弱信号救援补充证据
+        self.YOLO_INJ_THRESH  = 0.60   # YOLO 置信度注入门限（≥60% 才有效）
+        self.YOLO_INJ_WEIGHT  = 0.15   # YOLO 注入分值（使 0.85→1.00 跨越检测线）
+        self.SDS_RESCUE_LO    = 0.85   # SDS 救援区间下限（低于此不注入，证据不足）
+        self.SDS_RESCUE_HI    = 1.00   # SDS 救援区间上限（≥此已自行通过，无需注入）
 
 
         # RF 与视觉通道的最新帧缓存（供多模态证据融合使用）
@@ -246,44 +263,90 @@ class CentralHubEngine(QObject):
                 if rf_log.strip():
                     self.signal_log.emit(rf_log)
 
-                # ── 自适应时序持久化滤波器（Adaptive TPF v2）─────────────────────
-                # 分支 A — 强信号旁路（bypass）:
-                #   score ≥ 3× th_calibrated → 单 tick 直通，无延迟
-                #   Pfa 在此 NCC 量级下由 PSR+CFS 保证 < 0.1%，TPF 无需加锁
-                #
-                # 分支 B — 弱信号确认:
-                #   th ≤ score < 3× th → 维持 2-tick 计数确认（P_fa_final ≈ 0.25%）
-                #
-                # 分支 C — 噪声:
-                #   score < th → streak 归零
+                # ── 自适应时序持久化滤波器 v4.0（Tri-Level Elastic TPF）────────────
+                # 分支 A — 强信号直通（N=1）:
+                #   score ≥ RF_STRONG_BYPASS_RATIO × th → 单 tick 直通
+                #   AFS+PSR+CFS 联合保证 Pfa < 0.1%
+                # 分支 B — 中等信号（N=2）:
+                #   RF_MED_BYPASS_RATIO × th ≤ score < RF_STRONG_BYPASS_RATIO × th
+                #   P_fa_final = P_fa_tick² ≈ 0.25%
+                # 分支 C — 弱信号（N=3）:
+                #   th ≤ score < RF_MED_BYPASS_RATIO × th
+                #   P_fa_final = P_fa_tick³ ≈ 0.0125%
+                # 分支 D — 噪声：streak 衰减（不归零，保留历史积累）
+                #   streak[t+1] = max(0, streak[t] − RF_STREAK_DECAY)
                 # ────────────────────────────────────────────────────────────────
+
+                # YOLO 补充分注入（v4.0）
+                # 受 cfg.YOLO_ASSIST_ENABLED 开关控制：
+                #   False（当前默认）→ 整段逻辑跳过，S2 完全不参与 SDS 判决
+                #   True            → 开启弱信号救援注入（需先完成 5.8GHz 数据集重训）
+                # 启用条件见 config.py YOLO_ASSIST_ENABLED 注释。
+                if cfg.YOLO_ASSIST_ENABLED:
+                    yolo_score    = rf_info.get("yolo_score", 0.0) if rf_info else 0.0
+                    sds_detail    = rf_info.get("sds_detail", {}) if rf_info else {}
+                    sds_composite = sds_detail.get("composite", 0.0)
+                    yolo_inject   = (
+                        (not rf_alert)
+                        and (self.SDS_RESCUE_LO <= sds_composite < self.SDS_RESCUE_HI)
+                        and (yolo_score >= self.YOLO_INJ_THRESH)
+                    )
+                    if yolo_inject:
+                        sds_final = sds_composite + self.YOLO_INJ_WEIGHT
+                        self.signal_log.emit(
+                            f"[RF-YOLO] SDS 救援注入：SDS={sds_composite:.3f} + "
+                            f"YOLO({yolo_score:.2f})×{self.YOLO_INJ_WEIGHT} "
+                            f"→ S_final={sds_final:.3f} ≥ 1.0 → 强制触发告警"
+                        )
+                        rf_alert = True  # 覆盖 S3 的 False，允许进入 TPF 确认流程
+                        if not rf_info:
+                            rf_info = {}
+                        rf_info["score"] = sds_final  # 用修正后的综合分替代原始 NCC
+
                 if rf_alert:
-                    freq_mhz = rf_info.get("freq_mhz", 0.0)
-                    score    = rf_info.get("score",    0.0)
+                    freq_mhz  = rf_info.get("freq_mhz", 0.0)
+                    score     = rf_info.get("score",    0.0)
                     bypass_th = self._get_bypass_threshold(freq_mhz)
+                    med_th    = bypass_th / self.RF_STRONG_BYPASS_RATIO * self.RF_MED_BYPASS_RATIO
 
                     if score >= bypass_th:
-                        # ── 分支 A：强信号直通 ──────────────────────────────────
-                        self._rf_confirm_streak = self.RF_CONFIRM_REQUIRED  # 直接置满
+                        # ── 分支 A：强信号直通（N=1）────────────────────────────
+                        n_required = 1
+                        self._rf_confirm_streak = float(self.RF_CONFIRM_REQUIRED)  # 置满
                         self._rf_confirm_info   = rf_info
-                        # 中性措辞：说明"正在直通确认"而非"已检测到"
                         self.signal_log.emit(
-                            f"[RF-PRE] 强信号特征吻合，执行直通确认 "
-                            f"@ {freq_mhz:.0f} MHz  "
-                            f"NCC={score*100:.2f}%（≥ {bypass_th*100:.2f}% 旁路阈值）")
-                    else:
-                        # ── 分支 B：弱信号 2-tick 确认 ──────────────────────────
-                        self._rf_confirm_streak += 1
-                        self._rf_confirm_info    = rf_info
-                        streak = self._rf_confirm_streak
-                        # 中性措辞：说明"射频特征吻合，等待二次确认"
-                        self.signal_log.emit(
-                            f"[RF-PRE] 射频特征初步吻合 ({streak}/{self.RF_CONFIRM_REQUIRED})"
+                            f"[RF-PRE] 强信号直通（N=1）"
                             f" @ {freq_mhz:.0f} MHz  "
-                            f"NCC={score*100:.1f}%  等待第 {self.RF_CONFIRM_REQUIRED} 次确认...")
+                            f"NCC={score*100:.2f}%（≥ {bypass_th*100:.2f}% 旁路阈值）")
+                    elif score >= med_th:
+                        # ── 分支 B：中等信号（N=2）────────────────────────────
+                        n_required = 2
+                        self._rf_confirm_streak = min(
+                            self._rf_confirm_streak + 1.0,
+                            float(self.RF_CONFIRM_REQUIRED)
+                        )
+                        self._rf_confirm_info = rf_info
+                        streak = self._rf_confirm_streak
+                        self.signal_log.emit(
+                            f"[RF-PRE] 中等信号（N=2）({streak:.1f}/{n_required})"
+                            f" @ {freq_mhz:.0f} MHz  "
+                            f"NCC={score*100:.1f}%")
+                    else:
+                        # ── 分支 C：弱信号（N=3）──────────────────────────────
+                        n_required = 3
+                        self._rf_confirm_streak = min(
+                            self._rf_confirm_streak + 1.0,
+                            float(self.RF_CONFIRM_REQUIRED)
+                        )
+                        self._rf_confirm_info = rf_info
+                        streak = self._rf_confirm_streak
+                        self.signal_log.emit(
+                            f"[RF-PRE] 弱信号（N=3）({streak:.1f}/{n_required})"
+                            f" @ {freq_mhz:.0f} MHz  "
+                            f"NCC={score*100:.1f}%  等待第 {n_required} 次确认...")
 
-                    if self._rf_confirm_streak >= self.RF_CONFIRM_REQUIRED:
-                        # 达标（bypass 直通 或 累计确认）→ 发出最终告警
+                    if self._rf_confirm_streak >= n_required:
+                        # 达标 → 发出最终告警
                         self.signal_system_status.emit({
                             "system": "[!] Alert: OcuSync RF Detected!",
                             "color":  "#e74c3c",
@@ -291,23 +354,33 @@ class CentralHubEngine(QObject):
                         })
                         freq      = self._rf_confirm_info.get("freq_mhz", 0.0)
                         score_out = self._rf_confirm_info.get("score",    0.0)
-                        # ── 最终确认：红色 HTML 告警行（醒目，放在所有过程日志之后）──
+                        yolo_out  = self._rf_confirm_info.get("yolo_score", 0.0)
+                        yolo_tag  = f"  YOLO={yolo_out:.2f}" if yolo_out > 0 else ""
                         self.signal_log.emit(
                             f'<span style="color:#ef4444; font-weight:bold;">'
-                            f'⚠ [RF-ALARM] OcuSync 无人机信号已双重确认！'
-                            f' @ {freq:.0f} MHz  NCC={score_out*100:.2f}%'
+                            f'⚠ [RF-ALARM] OcuSync 无人机信号已确认（N={n_required}）！'
+                            f' @ {freq:.0f} MHz  NCC={score_out*100:.2f}%{yolo_tag}'
                             f' — 告警已入库，证据图像正在写入...</span>')
                         self._trigger_composite_save("SDR_OMNI_TRIGGER", freq, score_out)
                         # 不重置 streak，维持告警状态直到信号消失
+
                 else:
-                    # ── 分支 C：S3 未通过，归零计数器 ──────────────────────────
-                    if self._rf_confirm_streak > 0:
+                    # ── 分支 D：S3+YOLO 均未通过，streak 衰减（v4.0：不归零）────
+                    prev_streak = self._rf_confirm_streak
+                    self._rf_confirm_streak = max(
+                        0.0, self._rf_confirm_streak - self.RF_STREAK_DECAY
+                    )
+                    if prev_streak > 0 and self._rf_confirm_streak <= 0:
                         self.signal_log.emit(
-                            f"[RF-SCAN] 信号中断，射频特征确认计数重置 "
-                            f"({self._rf_confirm_streak} → 0)，继续扫描")
-                    self._rf_confirm_streak = 0
+                            f"[RF-SCAN] streak 衰减完毕 "
+                            f"({prev_streak:.1f} → 0)，继续扫描")
+                    elif prev_streak > self._rf_confirm_streak + 0.01:
+                        self.signal_log.emit(
+                            f"[RF-SCAN] streak 衰减中 "
+                            f"({prev_streak:.1f} → {self._rf_confirm_streak:.1f})")
+                    freq_display = rf_info.get('freq_mhz', 0) if rf_info else 0
                     self.signal_system_status.emit({
-                        "system": f"系统状态: [扫描] ({rf_info.get('freq_mhz', 0):.0f}MHz)" if rf_info else "系统状态: 主管道全速扫描中...",
+                        "system": f"系统状态: [扫描] ({freq_display:.0f}MHz)" if freq_display else "系统状态: 主管道全速扫描中...",
                         "color": "#27ae60"
                     })
 

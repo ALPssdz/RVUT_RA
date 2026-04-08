@@ -1,18 +1,23 @@
 """
-主射频检测流水线（RF Detection Pipeline）
-==========================================
-实现三级级联检测架构（S1 → S2 → S3）：
+主射频检测流水线 v4.0（RF Detection Pipeline）
+==============================================
+实现三级级联检测架构（S1 → S2 → S3），v4.0 引入跨级信息融合：
 
-  Stage 1 (S1): 快速 RSSI 预扫（Fast Power Pre-scan）
-    — 对所有扫描扇区进行宽带功率测量，以最小时间开销确定信号占优扇区
+  Stage 1 (S1) v4.0: 峰度加权快速预扫（Kurtosis-Weighted Pre-scan）
+    — 引入信号峰度 κ = E[|x|⁴]/(E[|x|²])² 加权扇区排名
+    — 有效感知低占空比 OcuSync 突发帧的弱信号扇区（κ≫3→权重提升 40~80%）
+    — S1_BUFFER_SIZE=524288（13.1ms），3帧中值滤波，smooth_alpha=0.35
 
   Stage 2 (S2): 短时驻留与频谱成像（Dwell & Spectrogram Generation）
     — 在 S1 选定扇区采集高时间分辨率 IQ 数据，生成 640×640 短时傅里叶变换瀑布图
     — 运行 YOLOv8 目标检测（平台自适应：x86_64 用 torch，aarch64 用 RKNN NPU）
+    — v4.0：YOLO bbox_score 注入 alert_info，供 system_hub SDS 评分融合使用
 
-  Stage 3 (S3): 循环谱物理层审计（Cyclostationary Physical-Layer Audit）
-    — 基于 OcuSync 协议的 OFDM 循环前缀时延特征进行协议指纹识别
-    — 独立运行，不依赖 S2 YOLO 推理结果触发
+  Stage 3 (S3) v4.0: 四重互验证 + 软判决评分融合
+    — CAF-FFT 循环谱 + PSR + CFS + AFS（α 域频率稳定性）四重正交验证
+    — SDS（软判决评分）代替纯硬串联：S = 0.45·NCC + 0.25·PSR + 0.20·CFS + 0.10·AFS
+    — 软下限 0.80×th 允许微弱信号在其他证据充分时被综合评分救援
+    — CHUNK_SIZE=160000（4ms），OVERLAP=0.80，PEAK_WEIGHT=0.65
 
 平台支持：
   - 开发机 (x86_64)  : YOLO 使用 ultralytics + PyTorch CPU 推理
@@ -95,9 +100,10 @@ def active_yolo_inference(model, tensor_bgr: np.ndarray):
     -------
     (bool, float, ndarray) : (检测标志, 最高置信度, 标注图像)
 
-    说明：
-      当前检测结果仅用于 UI 显示，不参与 S3 告警触发逻辑。
-      基于 5.8 GHz 数据重训 YOLO 后，可恢复为 S2-YOLO 串联 S3 的双重校验架构。
+    v4.0 说明：
+      bbox_score 现在被传递至 alert_info["yolo_score"]，
+      供 system_hub 的 SDS 评分融合作为第五个正交证据维度。
+      YOLO 单独不触发告警，仅在 S3 SDS 评分接近门限时提供补充分值。
     """
     try:
         results = model.predict(source=tensor_bgr, verbose=False)
@@ -164,26 +170,30 @@ class RFToolchain:
 
     def tick(self):
         """
-        执行一次完整的三级检测周期。
+        执行一次完整的三级检测周期（v4.0）。
 
         Returns
         -------
         (ndarray, str, bool, dict) :
           annotated_frame : 带标注的频谱瀑布图（640×640×3 BGR）
           log_text        : 本周期诊断日志
-          alert_flag      : OcuSync 告警标志
-          alert_info      : 告警附属信息（freq_mhz, score）
+          alert_flag      : S3 初步告警标志（由 system_hub TPF 二次确认后才发出最终告警）
+          alert_info      : 告警附属信息，v4.0 新增字段：
+            · freq_mhz    : 当前扇区中心频率（MHz）
+            · score       : S3 NCC 联合统计量
+            · yolo_score  : S2 YOLO 最高置信度（system_hub SDS 融合用）
+            · sds_detail  : S3 内部 SDS 分项评分（诊断用）
         """
         self.cycle_count += 1
         log_lines = []
 
-        # ── Stage 1：RSSI 快速功率预扫 ────────────────────────────────────────
-        ranked_sectors      = self.stage1_rssi.scan_and_rank()
-        active_freq, rssi_top = ranked_sectors[0]
+        # ── Stage 1：峰度加权快速预扫 v4.0 ──────────────────────────────────
+        ranked_sectors        = self.stage1_rssi.scan_and_rank()
+        active_freq, s1_score = ranked_sectors[0]
         log_lines.append(
             f"\n===== [Cycle {self.cycle_count}] "
             f"S1 Priority: {active_freq/1e6:.0f} MHz "
-            f"(P_rx = {rssi_top*1e6:.2f} μW) ====="
+            f"(κ-weighted score = {s1_score*1e6:.2f} μW-eq) ====="
         )
 
         # ── Stage 2：LO 调谐与频谱成像 ────────────────────────────────────────
@@ -205,6 +215,14 @@ class RFToolchain:
 
         cv2.putText(annotated_frame, f"SECTOR: {active_freq/1e6:.0f} MHz",
                     (10, 30), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 0), 2)
+
+        # v4.0: YOLO 评分标注到频谱图（绿=命中，灰=未达阈值）
+        if self.brain_yolo is not None:
+            yolo_color = (0, 255, 0) if yolo_flag else (120, 120, 120)
+            cv2.putText(annotated_frame,
+                        f"YOLO: {'HIT' if yolo_flag else 'NEG'} ({bbox_score:.2f})",
+                        (10, 620), cv2.FONT_HERSHEY_SIMPLEX, 0.7, yolo_color, 2)
+
         log_lines.append(
             f"[S2] Freq={active_freq/1e6:.0f} MHz | "
             f"Cost={cost_s2:.3f} s | "
@@ -212,17 +230,29 @@ class RFToolchain:
             f"[{backend_tag}]"
         )
 
-        # ── Stage 3：循环谱物理层审计 ─────────────────────────────────────────
+        # ── Stage 3：循环谱物理层审计 v4.0 ────────────────────────────────────
         t1 = time.time()
         confirm_flag, audit_score = self.stage3_audit.run_spectral_audit(
             self.stage2_vision.last_buffer_iq,
             sector_hz=active_freq,
         )
+        sds_detail = dict(self.stage3_audit.last_sds_detail)  # 取一份诊断副本
         cost_s3 = time.time() - t1
+
+        # SDS 分项摘要（仅在有评分时显示）
+        sds_log = ""
+        if sds_detail:
+            sds_log = (
+                f" | SDS: NCC={sds_detail.get('ncc_ratio',0):.2f} "
+                f"PSR={sds_detail.get('psr_score',0):.2f} "
+                f"CFS={sds_detail.get('cfs_score',0):.2f} "
+                f"AFS={sds_detail.get('afs_score',0):.1f} "
+                f"→ S={sds_detail.get('composite',0):.3f}"
+            )
         log_lines.append(
             f"[S3] Cost={cost_s3:.3f} s | "
             f"Result={'DETECTED' if confirm_flag else 'NEGATIVE'} "
-            f"(score={audit_score:.4f})"
+            f"(NCC={audit_score:.4f}){sds_log}"
         )
 
         alert_flag = False
@@ -232,13 +262,28 @@ class RFToolchain:
             log_lines.append(
                 f"[S3-PASS] OcuSync 协议特征吻合 "
                 f"@ {active_freq/1e6:.0f} MHz  "
-                f"NCC={audit_score:.4f}  → 提交 TPF 二次确认"
+                f"NCC={audit_score:.4f}  YOLO={bbox_score:.3f}  → 提交 TPF 确认"
             )
             alert_flag = True
-            alert_info = {"freq_mhz": active_freq / 1e6, "score": audit_score}
+            alert_info = {
+                "freq_mhz":   active_freq / 1e6,
+                "score":      audit_score,
+                "yolo_score": bbox_score,          # v4.0 新增：YOLO 得分供 TPF/SDS 融合
+                "sds_detail": sds_detail,           # v4.0 新增：SDS 分项诊断
+            }
             cv2.putText(annotated_frame, f"S3 PASS  NCC={audit_score:.3f}",
                         (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-            # 注意：此处不输出"检测到无人机"文字，最终告警由 system_hub TPF 在二次确认后输出
+
+        else:
+            # S3 未触发但 YOLO 命中：记录辅助信息（供 system_hub 统计）
+            if yolo_flag:
+                alert_info = {
+                    "freq_mhz":   active_freq / 1e6,
+                    "score":      audit_score,       # S3 NCC（未超阈值）
+                    "yolo_score": bbox_score,        # YOLO 命中作为辅助证据
+                    "yolo_only":  True,              # 标记：S3 未确认，仅 YOLO
+                    "sds_detail": sds_detail,
+                }
 
         return annotated_frame, "\n".join(log_lines), alert_flag, alert_info
 
