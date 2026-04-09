@@ -199,6 +199,14 @@ class RKNNLiteInfer:
 
         outputs = self._rknn.inference(inputs=[img_4d])
 
+        # ── 调试日志：每次推理都输出置信度概况 ──
+        _dbg = outputs[0].astype(np.float32)
+        if _dbg.ndim == 3: _dbg = _dbg[0]
+        _scores = _dbg.T[:, 4:]
+        _top3 = np.sort(_scores.flatten())[-3:][::-1]
+        print(f"  [RKNN-DBG] top3_conf={[round(float(x),4) for x in _top3]}  "
+              f"above_0.6={int((_scores.flatten()>0.6).sum())}")
+
         detections = _decode_yolov8_output(
             outputs, self._conf_thresh,
             orig_h, orig_w, ratio, pad_left, pad_top
