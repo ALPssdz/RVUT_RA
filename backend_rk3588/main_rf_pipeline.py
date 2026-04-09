@@ -116,7 +116,14 @@ def active_yolo_inference(model, tensor_bgr: np.ndarray):
         for r in results:
             boxes = r.boxes
             if boxes is not None and len(boxes) > 0:
-                confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else boxes.conf.numpy()
+                conf_raw = boxes.conf
+                # 兼容 torch.Tensor（ultralytics）和 np.ndarray（RKNN）
+                if hasattr(conf_raw, 'cpu'):
+                    confs = conf_raw.cpu().numpy()
+                elif hasattr(conf_raw, 'numpy'):
+                    confs = conf_raw.numpy()
+                else:
+                    confs = np.asarray(conf_raw)
                 highest_score = float(np.max(confs))
 
         is_detected     = highest_score > cfg.YOLO_CONF_THRESH

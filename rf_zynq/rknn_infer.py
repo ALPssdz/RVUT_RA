@@ -113,14 +113,15 @@ class _FakeResult:
     """
     class _Boxes:
         def __init__(self, detections):
-            import torch
+            # 纯 numpy 实现，不依赖 torch（RK3588 可能未安装 PyTorch）
             if detections:
-                self.conf = torch.tensor([d['conf'] for d in detections])
+                self.conf = np.array([d['conf'] for d in detections], dtype=np.float32)
             else:
-                self.conf = torch.tensor([])
+                self.conf = np.array([], dtype=np.float32)
 
         def __len__(self):
             return len(self.conf)
+
 
     def __init__(self, detections: list, img_bgr: np.ndarray):
         self.boxes = self._Boxes(detections)
