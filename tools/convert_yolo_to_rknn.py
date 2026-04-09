@@ -89,8 +89,10 @@ with open(DATASET_TXT, "w") as f:
         f.write(p + "\n")
 print(f"[Step 3] 量化校准集: {len(calib_imgs)} 张图像 → {DATASET_TXT}")
 
-# ── Step 4：RKNN 转换与 INT8 量化 ─────────────────────────────────────────────
-print("[Step 4] 开始 RKNN 转换（目标平台: rk3588）...")
+# ── Step 4：RKNN 转换（FP16 模式，避免 INT8 量化精度损失） ─────────────────
+# 注意：INT8 量化会导致 YOLOv8 类别置信度通道归零（已验证）。
+# RK3588 NPU 原生支持 FP16 推理，精度完全保留，速度仅比 INT8 慢约 30%。
+print("[Step 4] 开始 RKNN 转换（FP16 模式，目标平台: rk3588）...")
 from rknn.api import RKNN
 
 rknn = RKNN(verbose=False)
@@ -100,21 +102,21 @@ rknn.config(
     mean_values=[[0, 0, 0]],
     std_values=[[255, 255, 255]],
     target_platform='rk3588',
-    quantized_dtype='asymmetric_quantized-8',   # INT8 量化
     optimization_level=3,
 )
 
 ret = rknn.load_onnx(model=OUTPUT_ONNX)
 assert ret == 0, f"[ERROR] ONNX 加载失败（code: {ret}）"
 
-ret = rknn.build(do_quantization=True, dataset=DATASET_TXT)
+# FP16 模式：do_quantization=False → 跳过 INT8 量化，保持 FP16 精度
+ret = rknn.build(do_quantization=False)
 assert ret == 0, f"[ERROR] RKNN 编译失败（code: {ret}）"
 
 ret = rknn.export_rknn(OUTPUT_RKNN)
 assert ret == 0, f"[ERROR] RKNN 导出失败（code: {ret}）"
 
 rknn.release()
-print(f"[Step 4] RKNN 模型已生成: {OUTPUT_RKNN}")
+print(f"[Step 4] RKNN 模型已生成（FP16）: {OUTPUT_RKNN}")
 print()
 print("=" * 60)
 print(f"  转换完成！")

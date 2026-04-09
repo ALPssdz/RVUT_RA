@@ -54,11 +54,6 @@ def _letterbox(img: np.ndarray, target_size: int = 640):
     return padded, ratio, pad_left, pad_top
 
 
-def _sigmoid(x):
-    """数值稳定的 sigmoid：1 / (1 + exp(-x))"""
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
-
-
 def _decode_yolov8_output(outputs: list, conf_thresh: float,
                            orig_h: int, orig_w: int,
                            ratio: float, pad_left: int, pad_top: int) -> list:
@@ -67,14 +62,12 @@ def _decode_yolov8_output(outputs: list, conf_thresh: float,
 
     YOLOv8 输出格式（单类检测，经 ONNX 导出后）：
       outputs[0].shape = (1, 5 + num_classes, num_anchors)
-      其中前 4 个通道为 cx, cy, w, h（相对 640×640）
-      后续通道为各类别 logit（未经 sigmoid）
+      其中前 4 个通道为 cx, cy, w, h（相对 640×640 像素坐标）
+      后续通道为各类别置信度（ONNX 导出已内含 sigmoid，值域 [0, 1]）
 
-    INT8 量化说明：
-      RKNN 转换时将输入/输出从 float32 转为 int8。
-      rknn_toolkit_lite2 的 inference() 默认返回反量化后的 float32 值，
-      但 YOLOv8 的类别输出是 raw logit（未经 sigmoid），
-      需手动应用 sigmoid 变换获得 [0, 1] 范围的置信度。
+    注意：
+      YOLOv8 ultralytics ONNX 导出会自动将 sigmoid 融入计算图，
+      因此输出的类别值已经是 [0, 1] 范围的置信度，无需再做 sigmoid。
 
     Returns
     -------
@@ -87,12 +80,9 @@ def _decode_yolov8_output(outputs: list, conf_thresh: float,
         preds = preds[0]         # (5+nc, anchors)
     preds = preds.T              # (anchors, 5+nc)
 
-    # 提取坐标和类别 logit
-    boxes_xywh   = preds[:, :4]                # (anchors, 4) — cx, cy, w, h
-    class_logits = preds[:, 4:]                # (anchors, nc) — raw logit
-
-    # ── 类别置信度：sigmoid(logit) ──
-    class_conf = _sigmoid(class_logits)        # (anchors, nc) → [0, 1]
+    # 提取坐标和类别置信度（已经过 sigmoid，无需再变换）
+    boxes_xywh = preds[:, :4]                  # (anchors, 4)
+    class_conf = preds[:, 4:]                  # (anchors, nc) — 已是 [0, 1]
     max_conf   = np.max(class_conf, axis=1)    # (anchors,)
 
     # 快速筛选：仅处理超过阈值的锚点
