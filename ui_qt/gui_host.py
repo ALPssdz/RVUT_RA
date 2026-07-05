@@ -499,14 +499,14 @@ class StatusBannerCard(QFrame):
 # ──────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     """
-    RF-Vision 主上位机表现层（v2.0 现代化重构）。
+    RF-RA8P1 主上位机表现层。
 
     严格视图层：零业务逻辑，与 CentralHubEngine 通过 Qt 信号槽单向连接。
     """
 
     def __init__(self, hub=None):
         super().__init__()
-        self.setWindowTitle("RF-Vision  ·  无人机多模态探测系统  v2.0")
+        self.setWindowTitle("RF-RA8P1  ·  无人机射频预警系统")
         self.resize(1680, 980)
         self.setStyleSheet(GLOBAL_STYLESHEET)
 
@@ -554,7 +554,6 @@ class MainWindow(QMainWindow):
         # ── Hub 信号连接 ─────────────────────────────────────────────
         if self.hub:
             self.hub.signal_rf_frame.connect(self.update_rf_frame)
-            self.hub.signal_k230_frame.connect(self.update_k230_frame)
             self.hub.signal_log.connect(self.append_log)
             self.hub.signal_system_status.connect(self.update_status_labels)
             self.hub.signal_db_updated.connect(self.load_db_data)
@@ -627,7 +626,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(20, 0, 20, 0)
 
         # 左侧：系统名称
-        lbl_brand = QLabel("RF-Vision")
+        lbl_brand = QLabel("RF-RA8P1")
         lbl_brand.setStyleSheet(f"""
             color: {PALETTE['accent_blue']};
             font-size: 18px;
@@ -635,11 +634,11 @@ class MainWindow(QMainWindow):
         """)
 
 
-        lbl_sub = QLabel("无人机多模态射频 · 视觉融合探测系统")
+        lbl_sub = QLabel("RA8P1 主控裁决 · RK3588 射频算法协处理")
         lbl_sub.setStyleSheet(f"color: {PALETTE['text_muted']}; font-size: 12px; margin-left: 12px;")
 
         # 右侧：版本
-        lbl_ver = QLabel("v2.0  ·  RK3588 Edition")
+        lbl_ver = QLabel("UART 921600  ·  HDMI Console")
         lbl_ver.setStyleSheet(f"color: {PALETTE['text_muted']}; font-size: 11px;")
 
         lay.addWidget(lbl_brand)
@@ -661,18 +660,18 @@ class MainWindow(QMainWindow):
         banner.setSpacing(10)
 
         self._card_sdr     = StatusBannerCard("SDR 射频节点", "PlutoSDR  ·  休眠",   PALETTE['accent_blue'])
-        self._card_vision  = StatusBannerCard("视觉节点",     "K230  ·  休眠",        PALETTE['accent_amber'])
-        self._card_system  = StatusBannerCard("系统状态",     "待机  ·  等待启动指令", PALETTE['accent_cyan'])
+        self._card_ra8p1   = StatusBannerCard("RA8P1 主控",   "UART 921600  ·  待接入", PALETTE['accent_amber'])
+        self._card_system  = StatusBannerCard("系统状态",     "待机  ·  等待主控指令", PALETTE['accent_cyan'])
 
         # 告警计数器卡片
         self._card_alert   = StatusBannerCard("告警事件", "0 次告警", PALETTE['accent_red'])
 
-        for c in [self._card_sdr, self._card_vision, self._card_system, self._card_alert]:
+        for c in [self._card_sdr, self._card_ra8p1, self._card_system, self._card_alert]:
             banner.addWidget(c)
 
         root.addLayout(banner)
 
-        # ── 主内容区（左：RF频谱 | 中：K230视频 | 右：香橙派监控）───
+        # ── 主内容区（左：RF频谱 | 中：RA8P1裁决 | 右：香橙派监控）───
         content = QHBoxLayout()
         content.setSpacing(12)
 
@@ -714,26 +713,70 @@ class MainWindow(QMainWindow):
         left_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_w.setLayout(left_col)
 
-        # 中列：K230 视频
+        # 中列：RA8P1 主控裁决面板
         mid_col = QVBoxLayout()
         mid_col.setSpacing(8)
         mid_col.setContentsMargins(0, 0, 0, 0)
 
-        k230_card = QFrame()
-        k230_card.setObjectName("card")
-        k230_card_lay = QVBoxLayout(k230_card)
-        k230_card_lay.setContentsMargins(0, 0, 0, 0)
+        ra8p1_card = QFrame()
+        ra8p1_card.setObjectName("card")
+        ra8p1_card_lay = QVBoxLayout(ra8p1_card)
+        ra8p1_card_lay.setContentsMargins(0, 0, 0, 0)
+        ra8p1_card_lay.setSpacing(0)
 
-        k230_hdr = self._make_card_header("◉  K230 光电视觉推流", PALETTE['accent_amber'])
-        k230_card_lay.addWidget(k230_hdr)
+        ra8p1_hdr = self._make_card_header("◇  RA8P1 主控裁决台", PALETTE['accent_amber'])
+        ra8p1_card_lay.addWidget(ra8p1_hdr)
 
-        self.img_k230 = QLabel()
-        self.img_k230.setMinimumSize(1, 1)   # 同上，不设大值约束
-        self.img_k230.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.img_k230.setAlignment(Qt.AlignCenter)
-        self.img_k230.setStyleSheet("background-color: #010205; border-radius: 0 0 12px 12px;")
-        k230_card_lay.addWidget(self.img_k230, stretch=1)
-        mid_col.addWidget(k230_card, stretch=1)
+        ra8p1_body = QVBoxLayout()
+        ra8p1_body.setContentsMargins(20, 20, 20, 20)
+        ra8p1_body.setSpacing(14)
+
+        self.lbl_ra8p1_decision = QLabel("PENDING")
+        self.lbl_ra8p1_decision.setAlignment(Qt.AlignCenter)
+        self.lbl_ra8p1_decision.setMinimumHeight(96)
+        self.lbl_ra8p1_decision.setStyleSheet(f"""
+            color: {PALETTE['accent_amber']};
+            background-color: #090d16;
+            border: 1px solid {PALETTE['border']};
+            border-radius: 8px;
+            font-size: 34px;
+            font-weight: 800;
+        """)
+
+        self.lbl_ra8p1_link = QLabel("UART 921600  ·  待接入")
+        self.lbl_ra8p1_reason = QLabel("等待 RA8P1 主控链路接入；当前为 RF Agent 本地过渡模式")
+        for lbl in [self.lbl_ra8p1_link, self.lbl_ra8p1_reason]:
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(f"""
+                color: {PALETTE['text_secondary']};
+                background-color: #090d16;
+                border: 1px solid {PALETTE['border']};
+                border-radius: 8px;
+                padding: 12px;
+                font-size: 13px;
+            """)
+
+        rf_role = QLabel(
+            "RA8P1: 主控状态机与最终告警裁决\n"
+            "RK3588: RF 检测算法协处理与 HDMI 大屏\n"
+            "UART: 控制命令、检测报告、主控裁决"
+        )
+        rf_role.setWordWrap(True)
+        rf_role.setStyleSheet(f"""
+            color: {PALETTE['text_muted']};
+            background-color: transparent;
+            border: none;
+            font-size: 12px;
+            line-height: 1.4;
+        """)
+
+        ra8p1_body.addWidget(self.lbl_ra8p1_decision)
+        ra8p1_body.addWidget(self.lbl_ra8p1_link)
+        ra8p1_body.addWidget(self.lbl_ra8p1_reason)
+        ra8p1_body.addStretch()
+        ra8p1_body.addWidget(rf_role)
+        ra8p1_card_lay.addLayout(ra8p1_body, stretch=1)
+        mid_col.addWidget(ra8p1_card, stretch=1)
 
         mid_w = QWidget()
         mid_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -753,9 +796,9 @@ class MainWindow(QMainWindow):
         right_w.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         right_w.setLayout(right_col)
 
-        # stretch 3 : 4 : 固定280 — 1920px 全屏约：RF≈630px K230≈840px 右280px
-        content.addWidget(left_w,  stretch=3)
-        content.addWidget(mid_w,   stretch=4)
+        # stretch 4 : 3 : 固定280 — RF 频谱为主，RA8P1 裁决面板为第二展示中心
+        content.addWidget(left_w,  stretch=4)
+        content.addWidget(mid_w,   stretch=3)
         content.addWidget(right_w)
         root.addLayout(content, stretch=1)
 
@@ -999,7 +1042,7 @@ class MainWindow(QMainWindow):
         img_hdr = self._make_card_header("▢  证据图像预览", PALETTE['accent_amber'])
         img_card_lay.addWidget(img_hdr)
 
-        self.db_img_label = QLabel("请选择告警记录以显示关联的多模态证据图像")
+        self.db_img_label = QLabel("请选择告警记录以显示关联的射频证据图像")
         self.db_img_label.setAlignment(Qt.AlignCenter)
         self.db_img_label.setStyleSheet(
             f"background: transparent; color: {PALETTE['text_muted']};"
@@ -1016,14 +1059,28 @@ class MainWindow(QMainWindow):
     def update_rf_frame(self, frame):
         self.render_cv2_to_qlabel(frame, self.img_rf)
 
-    def update_k230_frame(self, frame):
-        self.render_cv2_to_qlabel(frame, self.img_k230)
-
     def update_status_labels(self, status_dict: dict):
         if "sdr" in status_dict:
             self._card_sdr.update_status(status_dict["sdr"])
-        if "vision" in status_dict:
-            self._card_vision.update_status(status_dict["vision"])
+        if "ra8p1" in status_dict:
+            self._card_ra8p1.update_status(status_dict["ra8p1"])
+            self.lbl_ra8p1_link.setText(status_dict["ra8p1"])
+        if "master_decision" in status_dict:
+            decision = status_dict["master_decision"]
+            self.lbl_ra8p1_decision.setText(decision)
+            color = PALETTE['accent_red'] if decision == "ALERT" else PALETTE['accent_amber']
+            if decision == "CLEAR":
+                color = PALETTE['accent_green']
+            self.lbl_ra8p1_decision.setStyleSheet(f"""
+                color: {color};
+                background-color: #090d16;
+                border: 1px solid {PALETTE['border']};
+                border-radius: 8px;
+                font-size: 34px;
+                font-weight: 800;
+            """)
+        if "decision_reason" in status_dict:
+            self.lbl_ra8p1_reason.setText(status_dict["decision_reason"])
         if "system" in status_dict:
             active = "△" in status_dict["system"] or "●" in status_dict["system"]
             color = status_dict.get("color", PALETTE['accent_cyan'])

@@ -3,20 +3,19 @@
 calibrate_s3.py -- S3 CAF-FFT Auto Background Calibration
 ==========================================================
 Automatically measures ambient NCC noise floor across all sectors,
-derives optimal detection thresholds, and patches the source file.
+derives optimal detection thresholds, and writes them to s3_thresholds.json.
 No user interaction required -- runs fully autonomously.
 
 Phases:
   Phase 1 -- Background noise baseline (UAV must be OFF)
              Capture IQ across all sectors, compute CAF-NCC floor.
-  Phase 2 -- Threshold derivation & auto-patch
-             th = max(HARD_FLOOR, bg_max x NOISE_MARGIN)
-             Auto-patches rf_zynq/rf_stage3_cyclostationary.py
+  Phase 2 -- Threshold derivation & JSON persistence
+             th = max(HARD_FLOOR, bg_eff x NOISE_MARGIN)
+             Runtime RF_Stage3_CycloAudit loads rf_zynq/s3_thresholds.json
 """
 
 import sys
 import os
-import re
 import time
 import numpy as np
 
@@ -25,29 +24,30 @@ _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)
 
-S3_SOURCE = os.path.join(_PROJ_ROOT, "rf_zynq", "rf_stage3_cyclostationary.py")
-OUT_DIR   = os.path.join(_PROJ_ROOT, "database", "alert_images")
+OUT_DIR = os.path.join(_PROJ_ROOT, "database", "alert_images")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # -- SDR parameters (read from config.py -- same values used at runtime) ------
 # IMPORTANT: calibration gain MUST equal operational gain (config.SDR_GAIN_DB).
 # Loading from config ensures a single source of truth.
 from backend_rk3588.config import SDR_URI, SAMPLE_RATE, SDR_GAIN_DB
+from rf_zynq.rf_stage3_cyclostationary import RF_Stage3_CycloAudit
+
 RX_GAIN     = SDR_GAIN_DB
 BUFFER_SIZE = 2_621_440   # 65 ms @ 40 MSps
 SECTORS_HZ  = [5745e6, 5785e6, 5825e6]
 N_CAPTURES  = 8           # IQ captures per sector (8 frames -> more stable bg estimate)
 
 # -- CAF scan parameters (identical to RF_Stage3_CycloAudit) ------------------
-# CHUNK_SIZE = 200_000 (5 ms @ 40 MSps).
-# Larger chunks (400k) were found to amplify SMPS harmonic NCC because the
-# integration window covers more exact SMPS cycles -> REVERTED to 200k.
-CHUNK_SIZE       = 200_000
-OVERLAP          = 0.75    # 75% overlap -- matches run_spectral_audit() exactly
-TAU_30K, TAU_15K = 1333, 2667
-ALPHA_SCAN_30K   = (22_000.0, 30_000.0)   # narrowed to OcuSync CP range
-ALPHA_SCAN_15K   = (10_500.0, 14_500.0)
-MIN_POWER_GATE   = 1e-5
+# Keep these values sourced from the runtime class. Calibration thresholds are
+# only valid when the CAF windowing and protocol parameters match detection.
+CHUNK_SIZE       = RF_Stage3_CycloAudit.CHUNK_SIZE
+OVERLAP          = RF_Stage3_CycloAudit.OVERLAP
+TAU_30K          = RF_Stage3_CycloAudit.TAU_OCUSYNC_30K
+TAU_15K          = RF_Stage3_CycloAudit.TAU_OCUSYNC_15K
+ALPHA_SCAN_30K   = RF_Stage3_CycloAudit.ALPHA_SCAN_30K
+ALPHA_SCAN_15K   = RF_Stage3_CycloAudit.ALPHA_SCAN_15K
+MIN_POWER_GATE   = RF_Stage3_CycloAudit.MIN_POWER_GATE
 
 # -- Threshold derivation parameters ------------------------------------------
 # Formula:
@@ -62,8 +62,8 @@ MIN_POWER_GATE   = 1e-5
 #   provide the remaining false-alarm suppression at runtime.
 NOISE_MARGIN   = 2.0
 BG_P95_WEIGHT  = 0.4    # weight on bg_p95; (1-0.4)=0.6 weight on bg_avg
-HARD_FLOOR_30K = 0.018  # 1.8%  (8x theoretical NCC floor 1/sqrt(200000))
-HARD_FLOOR_15K = 0.014  # 1.4%  (6x theoretical NCC floor)
+HARD_FLOOR_30K = RF_Stage3_CycloAudit.THRESHOLD_30K
+HARD_FLOOR_15K = RF_Stage3_CycloAudit.THRESHOLD_15K
 
 # =============================================================================
 # Core CAF-FFT metric (identical algorithm to RF_Stage3_CycloAudit)
@@ -176,7 +176,7 @@ def phase1_background():
 
     Upgrade over v1.0:
       Previously only one chunk (the center slice) was extracted per buffer.
-      Now all overlapping chunks (OVERLAP=0.75, identical to run_spectral_audit)
+      Now all overlapping chunks (using RF_Stage3_CycloAudit.OVERLAP)
       are analyzed per buffer, giving ~13x more frames per sector for a far
       more stable and representative background distribution.
 
@@ -191,7 +191,7 @@ def phase1_background():
     print(f"  Overlap={OVERLAP*100:.0f}%  ChunkSize={CHUNK_SIZE}  Captures={N_CAPTURES}")
     print("=" * 60)
 
-    step_size = int(CHUNK_SIZE * (1.0 - OVERLAP))   # 75% overlap → step = 50000
+    step_size = int(CHUNK_SIZE * (1.0 - OVERLAP))
 
     results = {}
     for freq in SECTORS_HZ:

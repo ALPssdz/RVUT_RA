@@ -4,6 +4,9 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 echo "=================================="
 echo "  RF-Vision-UAV-Tracker 部署脚本"
 echo "  目标平台: Orange Pi 5 (RK3588)"
@@ -19,15 +22,12 @@ fi
 # ── [1/4] 系统依赖 ────────────────────────────────────────────────────────────
 echo "[1/4] 安装系统依赖..."
 $APT update -qq
-$APT install -y python3-pip python3-pyqt5 python3-dev
+$APT install -y python3-pip python3-pyqt5 python3-dev libiio-dev libiio-utils
 
 # ── [2/4] Python 依赖 ─────────────────────────────────────────────────────────
 echo "[2/4] 安装 Python 依赖..."
 pip3 install --upgrade pip
-
-# 注意：ultralytics >= 8.3.x 依赖 polars，polars 需要 Rust 编译器，
-# 在 Python 3.8 / ARM64 上无预编译 wheel，固定至最后兼容版本 8.2.104
-pip3 install numpy matplotlib "ultralytics==8.2.103" opencv-python-headless
+pip3 install -r requirements.txt
 
 # ── [3/4] rknn_toolkit_lite2（可选，有 whl 才安装）──────────────────────────
 echo "[3/4] 检查 rknn_toolkit_lite2..."
@@ -43,7 +43,7 @@ fi
 
 # ── [4/4] 验证 ────────────────────────────────────────────────────────────────
 echo "[4/4] 基础验证..."
-python3 -c "import numpy, cv2, matplotlib, PyQt5; print('  [OK] 基础依赖验证通过')"
+python3 -c "import numpy, scipy, cv2, matplotlib, adi, PyQt5; print('  [OK] 基础依赖验证通过')"
 python3 -c "from backend_rk3588 import config; print(f'  [OK] IS_RK3588={config.IS_RK3588} | YOLO_BACKEND={config.YOLO_BACKEND}')"
 
 echo ""
@@ -51,8 +51,7 @@ echo "=================================="
 echo "  部署完成！"
 echo ""
 echo "  后续步骤："
-echo "  1. 编辑 config.py 确认 SDR_URI 和 K230 地址"
-echo "  2. python3 diag_s3_false_positive.py   # 背景噪声验证"
-echo "  3. python3 diag_uav_on_calibration.py  # 无人机信号验证"
-echo "  4. python3 system_hub.py               # 全系统启动"
+echo "  1. 编辑 config.py 确认 SDR_URI 和 RA8P1_UART_PORT"
+echo "  2. python3 rf_zynq/calibrate_s3.py     # 可选：单独执行背景噪声标定"
+echo "  3. python3 system_hub.py               # 全系统启动"
 echo "=================================="

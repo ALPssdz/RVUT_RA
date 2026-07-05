@@ -1,0 +1,18 @@
+# Core numeric and image stack
+numpy
+scipy
+matplotlib
+opencv-python-headless
+
+# SDR control. Provides the `adi` Python module used by pyadi-iio.
+pyadi-iio
+pyserial
+
+# YOLO CPU fallback and training tools.
+# 8.2.103 avoids newer ARM64 dependency issues on Python 3.8.
+ultralytics==8.2.103
+
+# Platform-specific notes:
+# - Install PyQt5 from the OS package manager on Orange Pi/RK3588.
+# - Install rknn_toolkit_lite2 from the Rockchip wheel when using RKNN NPU.
+# - Install torch only when using the PyTorch backend or training locally.

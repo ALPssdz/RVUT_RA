@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-import torch # [Patch]: 规避 PyTorch 与 PyQt5 的 C++ 动态链接库初始化冲突 (WinError 1114)
 import sys
 import os
 import time
 import threading
 import numpy as np
+
+# Optional preload: on some Windows/PyQt5 environments importing torch before Qt
+# avoids C++ runtime initialization failures. RKNN deployments may not ship torch.
+try:
+    import torch  # noqa: F401
+except ImportError:
+    torch = None
 
 PROJ_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJ_ROOT not in sys.path:
@@ -17,7 +23,6 @@ from PyQt5.QtCore import QObject, pyqtSignal
 
 from backend_rk3588 import config as cfg
 from backend_rk3588.main_rf_pipeline import RFToolchain
-from vision_k230.k230_client import K230NetworkClient
 from ui_qt.gui_host import MainWindow
 from database.db_manager import DBManager
 
@@ -97,18 +102,17 @@ class CentralHubEngine(QObject):
     """
     系统级中央调度引擎（Central Orchestration Engine）
 
-    基于事件总线（Event Bus）架构，负责协调射频检测子系统与光电视觉子系统
-    的并发数据流，执行跨模态特征融合对齐，将告警事件持久化写入数据库，
-    并通过 Qt 信号机制向 GUI 表现层广播实时状态。
+    基于事件总线（Event Bus）架构，负责协调射频检测子系统、RA8P1 主控
+    裁决链路与 HDMI 大屏上位机，将告警事件持久化写入数据库，并通过
+    Qt 信号机制向 GUI 表现层广播实时状态。
 
     子系统组成：
       - RFToolchain   : 三级射频检测流水线（S1-RSSI / S2-YOLO / S3-CycloAudit）
-      - K230Client    : K230 边缘端光电视觉流接收与带外信令解析
+      - RA8P1 Link    : UART 主控链路（RA8P1 负责最终裁决）
       - DBManager     : SQLite 告警事件持久化引擎
       - MainWindow    : PyQt5 GUI 表现层
     """
     signal_rf_frame = pyqtSignal(object)
-    signal_k230_frame = pyqtSignal(object)
     signal_log = pyqtSignal(str)
     signal_system_status = pyqtSignal(dict)
     signal_db_updated = pyqtSignal()
@@ -120,10 +124,6 @@ class CentralHubEngine(QObject):
         
         # 初始化各子系统节点
         self.rf_toolchain = RFToolchain()
-        self.k230_client  = K230NetworkClient(
-            rtsp_url=cfg.K230_RTSP_URL, udp_port=cfg.K230_UDP_PORT
-        )
-        self.k230_client.start()
         self.db_engine = DBManager()
 
         self.running        = False
@@ -164,9 +164,13 @@ class CentralHubEngine(QObject):
         self.SDS_RESCUE_HI    = 1.00   # SDS 救援区间上限（≥此已自行通过，无需注入）
 
 
-        # RF 与视觉通道的最新帧缓存（供多模态证据融合使用）
+        # RF 最新帧缓存（供证据图生成使用）
         self.cache_rf  = np.zeros((640, 640, 3),  dtype=np.uint8)
-        self.cache_vis = np.zeros((640, 1137, 3), dtype=np.uint8)
+        self.ra8p1_status = {
+            "link": "UART 921600  ·  待接入",
+            "decision": "PENDING",
+            "reason": "RF Agent local fallback",
+        }
 
         # 实例化 GUI 表现层并注入中央事件总线引用
         self.ui_window = MainWindow(hub=self)
@@ -179,9 +183,11 @@ class CentralHubEngine(QObject):
             "system": "[ACTIVE] 主管道全速轮询中...", 
             "color": "#27ae60",
             "sdr": "SDR 节点: [RX] IQ 数据采集中",
-            "vision": "视频节点: [RX] 画面及信令监听中"
+            "ra8p1": "RA8P1 主控: UART 921600 待接入",
+            "master_decision": "CLEAR",
+            "decision_reason": "RF Agent 本地扫描中，等待 RA8P1 主控裁决链路接入",
         })
-        self.signal_log.emit("采集管道启动：SDR 前端及视觉网络客户端已进入工作状态。")
+        self.signal_log.emit("采集管道启动：SDR 前端已进入工作状态，RA8P1 UART 主控链路待接入。")
         self._master_thread = threading.Thread(target=self._hub_loop, daemon=True)
         self._master_thread.start()
         
@@ -220,19 +226,40 @@ class CentralHubEngine(QObject):
 
     def stop_sensing(self):
         self.running = False
-        self.signal_system_status.emit({"system": "系统模式: [挂起] 任务挂起", "color": "#f1c40f"})
+        self.ra8p1_status["decision"] = "PENDING"
+        self.signal_system_status.emit({
+            "system": "系统模式: [挂起] 任务挂起",
+            "color": "#f1c40f",
+            "master_decision": "PENDING",
+            "decision_reason": "采集管道已停止",
+        })
         self.signal_log.emit("系统中央主循环进程已安全退出执行。")
         
 
     def _trigger_composite_save(self, reason_tag, freq_mhz, score):
         """
-        生成多模态证据融合图像并写入告警数据库。
+        生成射频证据图像并写入告警数据库。
 
-        将当前射频频谱帧（cache_rf）与视觉图像帧（cache_vis）水平拼接，
+        将当前射频频谱帧（cache_rf）与 RA8P1 裁决信息面板水平拼接，
         叠加告警标注后，调用 DBManager 完成持久化存储。
         """
         import cv2
-        fused_evidence = np.hstack([self.cache_rf, self.cache_vis])
+        panel = np.zeros((640, 640, 3), dtype=np.uint8)
+        panel[:] = (12, 17, 28)
+        cv2.putText(panel, "RA8P1 MASTER DECISION", (34, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 210, 255), 2)
+        cv2.putText(panel, f"Decision : {self.ra8p1_status.get('decision', 'PENDING')}", (34, 145),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.82, (80, 255, 120), 2)
+        cv2.putText(panel, f"Reason   : {reason_tag}", (34, 205),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2)
+        cv2.putText(panel, f"Freq     : {freq_mhz:.0f} MHz", (34, 265),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2)
+        cv2.putText(panel, f"Score    : {score:.4f}", (34, 325),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2)
+        cv2.putText(panel, f"Link     : {self.ra8p1_status.get('link', 'UART 921600')}", (34, 385),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (180, 180, 180), 2)
+
+        fused_evidence = np.hstack([self.cache_rf, panel])
         cv2.putText(fused_evidence, f"ALARM REASON: {reason_tag}", (20, 600), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
         
         new_id = self.db_engine.log_alert(freq_mhz, score, fused_evidence)
@@ -247,8 +274,8 @@ class CentralHubEngine(QObject):
 
         管线一（RF）：调用 RFToolchain.tick() 执行一次三级检测周期，
                       处理告警结果并更新 GUI 状态。
-        管线二（光电视觉）：从 K230 客户端获取视频帧与带外信令，
-                           若检测到目标则生成告警记录。
+        RA8P1 主控裁决链路将在后续阶段接入：当前版本保留 RF 本地确认
+        作为过渡路径，并在上位机明确标注 RA8P1 UART 待接入。
         """
         while self.running:
             # === [处理管线一：软件无线电跳频解调] ===
@@ -347,10 +374,17 @@ class CentralHubEngine(QObject):
 
                     if self._rf_confirm_streak >= n_required:
                         # 达标 → 发出最终告警
+                        self.ra8p1_status["decision"] = "ALERT"
+                        self.ra8p1_status["reason"] = f"RF_LOCAL_CONFIRMED_N{n_required}"
                         self.signal_system_status.emit({
                             "system": "[!] Alert: OcuSync RF Detected!",
                             "color":  "#e74c3c",
                             "alert":  True,
+                            "master_decision": "ALERT",
+                            "decision_reason": (
+                                f"过渡模式：RF 本地确认 N={n_required}；"
+                                "RA8P1 UART 接入后由主控返回最终裁决"
+                            ),
                         })
                         freq      = self._rf_confirm_info.get("freq_mhz", 0.0)
                         score_out = self._rf_confirm_info.get("score",    0.0)
@@ -379,9 +413,13 @@ class CentralHubEngine(QObject):
                             f"[RF-SCAN] streak 衰减中 "
                             f"({prev_streak:.1f} → {self._rf_confirm_streak:.1f})")
                     freq_display = rf_info.get('freq_mhz', 0) if rf_info else 0
+                    if self._rf_confirm_streak <= 0:
+                        self.ra8p1_status["decision"] = "CLEAR"
                     self.signal_system_status.emit({
                         "system": f"系统状态: [扫描] ({freq_display:.0f}MHz)" if freq_display else "系统状态: 主管道全速扫描中...",
-                        "color": "#27ae60"
+                        "color": "#27ae60",
+                        "master_decision": "CLEAR" if self._rf_confirm_streak <= 0 else "CANDIDATE",
+                        "decision_reason": "RF 未确认告警，持续扫描" if self._rf_confirm_streak <= 0 else "RF 候选目标确认中",
                     })
 
             except Exception as e:
@@ -389,35 +427,10 @@ class CentralHubEngine(QObject):
             finally:
                 self._tick_lock.release()
                 
-            # === [处理管线二：带外信令网络及边缘端光学流] ===
-            try:
-                k_frame, k_telemetry = self.k230_client.get_synced_data()
-                
-                if k_telemetry.get("alert", False):
-                    bbox = k_telemetry.get("bbox", [])
-                    if len(bbox) == 4:
-                        import cv2
-                        cv2.rectangle(k_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 8)
-                        cv2.putText(k_frame, "OOB JSON LOCK", (bbox[0], bbox[1]-20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-                        
-                    self.signal_system_status.emit({
-                        "system": "特征命中：目标物理轮廓验证通过",
-                        "color":  "#e74c3c",
-                        "alert":  True,   # 语义字段—GUI 告警计数使用
-                    })
-                    self.signal_log.emit("OOB 触发器：高速网络侧带外接收到正向标定数据包。")
-                    self._trigger_composite_save("K230_ZENITH_TRIGGER", 0.0, 1.0)
-                
-                self.cache_vis = k_frame
-                self.signal_k230_frame.emit(k_frame)
-            except Exception as e:
-                self.signal_log.emit(f"边缘侧光学流推流挂起异常: {e}")
-                
             time.sleep(0.001)  # 1ms 让出 CPU 给 Qt 事件循环，避免 UI 卡顿
 
     def shutdown(self):
         self.stop_sensing()
-        self.k230_client.stop()
 
 if __name__ == "__main__":
     # ── Step 1: 安装 stdout 重定向器 ──────────────────────────────────────────
