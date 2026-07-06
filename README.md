@@ -78,7 +78,7 @@ RA8P1 STOP_SCAN / RESET_ALERT / RUN_CALIBRATION are executed as master commands
 ```text
 IQ Samples
   -> S1 Kurtosis-Weighted RSSI Pre-scan
-  -> S2 Waterfall Generation / YOLO Assist
+  -> S2 Waterfall Display
   -> S3 Cyclostationary Audit
   -> RF Detection Report
   -> RA8P1 Master Decision

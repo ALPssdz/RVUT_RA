@@ -748,7 +748,7 @@ class MainWindow(QMainWindow):
         self.lbl_final_reason = QLabel("最终原因：等待 RF 证据与 RA8P1 主控确认")
         self.lbl_ra8p1_raw = QLabel("RA8P1实时回包：PENDING / 等待回包")
         self.lbl_rf_progress = QLabel("RF确认进度：未开始")
-        self.lbl_rf_metrics = QLabel("当前指标：Freq -- | NCC -- | SDS -- | YOLO --")
+        self.lbl_rf_metrics = QLabel("当前指标：Freq -- | NCC -- | SDS -- | PHY --")
         for lbl in [
             self.lbl_ra8p1_link,
             self.lbl_final_reason,

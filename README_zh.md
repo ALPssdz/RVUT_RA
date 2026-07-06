@@ -80,7 +80,7 @@ RA8P1 STOP_SCAN / RESET_ALERT / RUN_CALIBRATION：香橙派端按主控命令执
 ```text
 IQ Samples
   -> S1 Kurtosis-Weighted RSSI Pre-scan
-  -> S2 Waterfall Generation / YOLO Assist
+  -> S2 Waterfall Display
   -> S3 Cyclostationary Audit
   -> RF Detection Report
   -> RA8P1 Master Decision
@@ -97,10 +97,10 @@ RF-Vision-UAV-Tracker/
 │   └── main_rf_pipeline.py          # S1/S2/S3 RF 检测主控
 ├── rf_zynq/
 │   ├── rf_stage1_rssi_scan.py
-│   ├── rf_stage2_waterfall_yolo.py
+│   ├── rf_stage2_waterfall.py
 │   ├── rf_stage3_cyclostationary.py
 │   ├── calibrate_s3.py
-│   └── rknn_infer.py
+│   └── yolo/                         # 历史训练资料，正式检测链路不加载
 ├── protocol/
 │   ├── link_protocol.py             # RA8P1 <-> RK3588 消息编解码
 │   ├── ra8p1_link.py                # JDBG 虚拟串口链路

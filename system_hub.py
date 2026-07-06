@@ -6,13 +6,6 @@ import threading
 import numpy as np
 from typing import Optional
 
-# Optional preload: on some Windows/PyQt5 environments importing torch before Qt
-# avoids C++ runtime initialization failures. RKNN deployments may not ship torch.
-try:
-    import torch  # noqa: F401
-except ImportError:
-    torch = None
-
 PROJ_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJ_ROOT not in sys.path:
     sys.path.insert(0, PROJ_ROOT)
@@ -110,7 +103,7 @@ class CentralHubEngine(QObject):
     Qt 信号机制向 GUI 表现层广播实时状态。
 
     子系统组成：
-      - RFToolchain   : 三级射频检测流水线（S1-RSSI / S2-YOLO / S3-CycloAudit）
+      - RFToolchain   : 三级射频检测流水线（S1-RSSI / S2-Waterfall / S3-CycloAudit）
       - RA8P1 Link    : JDBG VCOM / SCI9 主控链路（RA8P1 负责最终裁决）
       - DBManager     : SQLite 告警事件持久化引擎
       - MainWindow    : PyQt5 GUI 表现层
@@ -177,17 +170,6 @@ class CentralHubEngine(QObject):
         self.RF_STRONG_BYPASS_RATIO = 3.0  # 强信号：score ≥ 3×th → N=1 直通
         self.RF_MED_BYPASS_RATIO    = 1.8  # 中等信号：score ≥ 1.8×th → N=2 快速确认
         self.RF_STREAK_DECAY        = 0.5  # 每 tick 衰减量（信号中断时）
-        #
-        # YOLO 补充分注入（v4.0 新增）：
-        #   当 S3 SDS 得分在 [SDS_RESCUE_LO, SDS_RESCUE_HI) 区间（接近但未达阈值）
-        #   且 YOLO bbox_score ≥ YOLO_INJ_THRESH 时，向 SDS 分注入 YOLO_INJ_WEIGHT
-        #   最终判决：S_final = S_sds + YOLO_INJ_WEIGHT（若满足注入条件）
-        #   注意：YOLO 单独不触发任何告警，仅作为弱信号救援补充证据
-        self.YOLO_INJ_THRESH  = 0.60   # YOLO 置信度注入门限（≥60% 才有效）
-        self.YOLO_INJ_WEIGHT  = 0.15   # YOLO 注入分值（使 0.85→1.00 跨越检测线）
-        self.SDS_RESCUE_LO    = 0.85   # SDS 救援区间下限（低于此不注入，证据不足）
-        self.SDS_RESCUE_HI    = 1.00   # SDS 救援区间上限（≥此已自行通过，无需注入）
-
 
         # RF 最新帧缓存（供证据图生成使用）
         self.cache_rf  = np.zeros((640, 640, 3),  dtype=np.uint8)
@@ -339,14 +321,18 @@ class CentralHubEngine(QObject):
 
     def _format_rf_metrics(self, rf_info: dict) -> str:
         if not rf_info:
-            return "Freq -- | NCC -- | SDS -- | YOLO --"
+            return "Freq -- | NCC -- | SDS -- | PHY --"
         sds_detail = rf_info.get("sds_detail", {}) or {}
         freq = float(rf_info.get("freq_mhz", 0.0))
         ncc = float(rf_info.get("score", 0.0))
         sds = float(sds_detail.get("composite", 0.0))
-        yolo = float(rf_info.get("yolo_score", 0.0))
+        phy = max(
+            float(sds_detail.get("psr_score", 0.0)),
+            float(sds_detail.get("cfs_score", 0.0)),
+            float(sds_detail.get("afs_score", 0.0)),
+        )
         freq_text = f"{freq:.0f} MHz" if freq > 0 else "--"
-        return f"Freq {freq_text} | NCC {ncc*100:.2f}% | SDS {sds:.3f} | YOLO {yolo:.2f}"
+        return f"Freq {freq_text} | NCC {ncc*100:.2f}% | SDS {sds:.3f} | PHY {phy:.2f}"
 
     def _record_rf_diagnostic_event(
         self,
@@ -373,7 +359,7 @@ class CentralHubEngine(QObject):
                 "sdr_uri": cfg.SDR_URI,
                 "sdr_gain_db": cfg.SDR_GAIN_DB,
                 "sample_rate": cfg.SAMPLE_RATE,
-                "yolo_assist_enabled": cfg.YOLO_ASSIST_ENABLED,
+                "waterfall_display_enabled": cfg.WATERFALL_DISPLAY_ENABLED,
                 "ra8p1_required": cfg.RA8P1_REQUIRED,
             },
         }
@@ -565,8 +551,6 @@ class CentralHubEngine(QObject):
         freq_mhz = float(rf_info.get("freq_mhz", 0.0))
         ncc = float(rf_info.get("score", 0.0))
         suggestion = "ALERT" if rf_alert else "CLEAR"
-        if not rf_alert and rf_info.get("yolo_only"):
-            suggestion = "CANDIDATE"
         if rf_alert:
             self.ra8p1_link.last_decision = {}
         self.ra8p1_link.send_detection_report(
@@ -646,32 +630,6 @@ class CentralHubEngine(QObject):
                 #   streak[t+1] = max(0, streak[t] − RF_STREAK_DECAY)
                 # ────────────────────────────────────────────────────────────────
 
-                # YOLO 补充分注入（v4.0）
-                # 受 cfg.YOLO_ASSIST_ENABLED 开关控制：
-                #   False（当前默认）→ 整段逻辑跳过，S2 完全不参与 SDS 判决
-                #   True            → 开启弱信号救援注入（需先完成 5.8GHz 数据集重训）
-                # 启用条件见 config.py YOLO_ASSIST_ENABLED 注释。
-                if cfg.YOLO_ASSIST_ENABLED:
-                    yolo_score    = rf_info.get("yolo_score", 0.0) if rf_info else 0.0
-                    sds_detail    = rf_info.get("sds_detail", {}) if rf_info else {}
-                    sds_composite = sds_detail.get("composite", 0.0)
-                    yolo_inject   = (
-                        (not rf_alert)
-                        and (self.SDS_RESCUE_LO <= sds_composite < self.SDS_RESCUE_HI)
-                        and (yolo_score >= self.YOLO_INJ_THRESH)
-                    )
-                    if yolo_inject:
-                        sds_final = sds_composite + self.YOLO_INJ_WEIGHT
-                        self.signal_log.emit(
-                            f"[RF-YOLO] SDS 救援注入：SDS={sds_composite:.3f} + "
-                            f"YOLO({yolo_score:.2f})×{self.YOLO_INJ_WEIGHT} "
-                            f"→ S_final={sds_final:.3f} ≥ 1.0 → 强制触发告警"
-                        )
-                        rf_alert = True  # 覆盖 S3 的 False，允许进入 TPF 确认流程
-                        if not rf_info:
-                            rf_info = {}
-                        rf_info["score"] = sds_final  # 用修正后的综合分替代原始 NCC
-
                 self._send_ra8p1_detection_report(rf_alert, rf_info)
                 self._pump_ra8p1_messages()
                 if rf_info:
@@ -679,14 +637,11 @@ class CentralHubEngine(QObject):
                     sds_composite = float(sds_detail.get("composite", 0.0))
                     should_capture = (
                         rf_alert
-                        or rf_info.get("yolo_only")
                         or sds_composite >= 0.75
                     )
                     if should_capture:
                         if rf_alert:
                             event_type = "rf_s3_pass"
-                        elif rf_info.get("yolo_only"):
-                            event_type = "rf_yolo_only"
                         else:
                             event_type = "rf_sds_near_miss"
                         self._record_rf_diagnostic_event(
@@ -790,13 +745,11 @@ class CentralHubEngine(QObject):
                         })
                         freq      = self._rf_confirm_info.get("freq_mhz", 0.0)
                         score_out = self._rf_confirm_info.get("score",    0.0)
-                        yolo_out  = self._rf_confirm_info.get("yolo_score", 0.0)
-                        yolo_tag  = f"  YOLO={yolo_out:.2f}" if yolo_out > 0 else ""
                         if final_decision == "ALERT":
                             self.signal_log.emit(
                                 f'<span style="color:#ef4444; font-weight:bold;">'
                                 f'⚠ [RF-ALARM] RA8P1 主控确认 OcuSync 告警（N={n_required}）！'
-                                f' @ {freq:.0f} MHz  NCC={score_out*100:.2f}%{yolo_tag}'
+                                f' @ {freq:.0f} MHz  NCC={score_out*100:.2f}%'
                                 f' — 告警已入库，证据图像正在写入...</span>')
                             self._trigger_composite_save("SDR_RA8P1_MASTER_TRIGGER", freq, score_out)
                         else:
@@ -807,7 +760,7 @@ class CentralHubEngine(QObject):
                         # 不重置 streak，维持告警状态直到信号消失
 
                 else:
-                    # ── 分支 D：S3+YOLO 均未通过，streak 衰减（v4.0：不归零）────
+                    # ── 分支 D：S3 未通过，streak 衰减（v4.0：不归零）────
                     prev_streak = self._rf_confirm_streak
                     self._rf_confirm_streak = max(
                         0.0, self._rf_confirm_streak - self.RF_STREAK_DECAY

@@ -10,7 +10,7 @@ class RF_Stage2_Dwell:
 
     本模块对 AD9364 SDR 前端执行单次大块 DMA 采集，通过向量化短时傅里叶变换
     （Vectorized STFT）将原始 IQ 数据转换为 640×640 BGR 伪彩色频谱瀑布图张量，
-    供后续 YOLOv8 推理端点消费。
+    供 HDMI 大屏展示、人工复核和 S3 循环谱模块复用 IQ 缓冲。
 
     采用批量 DMA 采集策略（单次调用 rx() 获取全部样本）以规避逐行轮询模式下
     USB 传输速率不足导致的 DMA 溢出（表现为瀑布图横向条带伪影）。
@@ -24,7 +24,7 @@ class RF_Stage2_Dwell:
             已完成参数配置的 AD9364 SDR 实例，由上层 RFToolchain 注入。
         """
         self.sdr = sdr_instance
-        self.target_width  = 640   # 输出图像宽度（像素），与 YOLOv8 输入尺寸一致
+        self.target_width  = 640   # 输出图像宽度（像素），与大屏展示区域一致
         self.target_height = 640   # 输出图像高度（像素），对应 STFT 帧数
         self.fft_size      = 2048  # 单帧 FFT 点数
         #   频率分辨率: 40 MSps / 2048 = 19.5 kHz/bin
