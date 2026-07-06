@@ -535,10 +535,10 @@ class MainWindow(QMainWindow):
         self.setup_live_dashboard()
         self.tabs.addTab(self.tab1, "  ◈  监测数据流")
 
-        # Tab 2：告警日志库
+        # Tab 2：射频证据日志库
         self.tab2 = QWidget()
         self.setup_evidence_database()
-        self.tabs.addTab(self.tab2, "  ▦  告警日志库")
+        self.tabs.addTab(self.tab2, "  ▦  证据日志库")
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
@@ -992,7 +992,7 @@ class MainWindow(QMainWindow):
         tb_lay = QHBoxLayout(toolbar_card)
         tb_lay.setContentsMargins(14, 0, 14, 0)
 
-        lbl_tb = QLabel("▦  告警证据数据库")
+        lbl_tb = QLabel("▦  射频证据数据库")
         lbl_tb.setStyleSheet(f"color: {PALETTE['text_primary']}; font-size: 14px; font-weight: 700;")
 
         self.btn_clear_db = QPushButton("✕  清除全部记录")
@@ -1001,7 +1001,7 @@ class MainWindow(QMainWindow):
         self.btn_clear_db.setFixedHeight(36)
         self.btn_clear_db.clicked.connect(self.on_clear_db_clicked)
 
-        self._lbl_db_count = QLabel("0 条记录")
+        self._lbl_db_count = QLabel("告警 0 条 / 未告警 0 条")
         self._lbl_db_count.setStyleSheet(f"color: {PALETTE['text_muted']}; font-size: 12px;")
 
         tb_lay.addWidget(lbl_tb)
@@ -1017,32 +1017,25 @@ class MainWindow(QMainWindow):
         # 表格
         table_card = QFrame()
         table_card.setObjectName("card")
-        table_card.setFixedWidth(420)
+        table_card.setFixedWidth(560)
         t_lay = QVBoxLayout(table_card)
         t_lay.setContentsMargins(0, 0, 0, 0)
 
         t_hdr = self._make_card_header("▤  事件列表", PALETTE['accent_blue'])
         t_lay.addWidget(t_hdr)
 
-        self.db_table = QTableWidget()
-        self.db_table.setColumnCount(4)
-        self.db_table.setHorizontalHeaderLabels(["ID", "触发时间", "频率 (MHz)", "置信度"])
-        self.db_table.setAlternatingRowColors(True)
-        self.db_table.setShowGrid(False)
-        self.db_table.verticalHeader().setVisible(False)
-        hdr = self.db_table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.db_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.db_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.db_table.itemSelectionChanged.connect(self.on_db_row_selected)
-        self.db_table.setStyleSheet("border: none; border-radius: 0 0 12px 12px;")
-        t_lay.addWidget(self.db_table, stretch=1)
+        self.event_tabs = QTabWidget()
+        self.db_table_alert = self._create_event_table()
+        self.db_table_normal = self._create_event_table()
+        self.db_table_alert.itemSelectionChanged.connect(self.on_db_row_selected)
+        self.db_table_normal.itemSelectionChanged.connect(self.on_db_row_selected)
+        self.event_tabs.addTab(self.db_table_alert, "告警记录")
+        self.event_tabs.addTab(self.db_table_normal, "未告警记录")
+        self.event_tabs.currentChanged.connect(lambda _: self.on_db_row_selected())
+        t_lay.addWidget(self.event_tabs, stretch=1)
         content.addWidget(table_card)
 
-        self.current_db_paths = []
+        self.current_db_paths = {"ALERT": [], "NORMAL": []}
 
         # 证据图片预览
         img_card = QFrame()
@@ -1053,7 +1046,7 @@ class MainWindow(QMainWindow):
         img_hdr = self._make_card_header("▢  证据图像预览", PALETTE['accent_amber'])
         img_card_lay.addWidget(img_hdr)
 
-        self.db_img_label = QLabel("请选择告警记录以显示关联的射频证据图像")
+        self.db_img_label = QLabel("请选择记录以显示关联的射频证据图像")
         self.db_img_label.setAlignment(Qt.AlignCenter)
         self.db_img_label.setStyleSheet(
             f"background: transparent; color: {PALETTE['text_muted']};"
@@ -1063,6 +1056,25 @@ class MainWindow(QMainWindow):
         content.addWidget(img_card, stretch=1)
 
         layout.addLayout(content, stretch=1)
+
+    def _create_event_table(self):
+        table = QTableWidget()
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["ID", "触发时间", "频率", "得分", "裁决", "原因"])
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
+        table.verticalHeader().setVisible(False)
+        hdr = table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(5, QHeaderView.Stretch)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setStyleSheet("border: none; border-radius: 0 0 12px 12px;")
+        return table
 
     # ==================================================================
     # 视图渲染回调
@@ -1172,7 +1184,7 @@ class MainWindow(QMainWindow):
     def on_clear_db_clicked(self):
         reply = QMessageBox.question(
             self, "确认清除",
-            "确定要删除全部告警记录和关联图片吗？\n此操作不可撤销。",
+            "确定要删除全部告警/未告警记录和关联图片吗？\n此操作不可撤销。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -1182,7 +1194,7 @@ class MainWindow(QMainWindow):
         self._alert_count = 0
         self._card_alert.update_status("0 次告警", active=False)
         self.load_db_data()
-        self.db_img_label.setText(f"已清除 {n} 条告警记录及关联图片。")
+        self.db_img_label.setText(f"已清除 {n} 条记录及关联图片。")
 
     def on_tab_changed(self, index: int):
         if index == 0:
@@ -1196,31 +1208,43 @@ class MainWindow(QMainWindow):
             self.load_db_data()
 
     def load_db_data(self):
-        rows = self.db_engine.get_all_alerts()
-        self.db_table.setRowCount(len(rows))
-        self.current_db_paths = []
-        for row_idx, data in enumerate(rows):
-            self.db_table.setItem(row_idx, 0, QTableWidgetItem(f"REC-{data[0]}"))
-            self.db_table.setItem(row_idx, 1, QTableWidgetItem(str(data[1])))
-            self.db_table.setItem(row_idx, 2, QTableWidgetItem(f"{data[2]} MHz"))
-            conf_item = QTableWidgetItem(f"{data[3] * 100:.1f} %")
-            if data[3] >= 0.9:
-                conf_item.setForeground(QColor(PALETTE['accent_red']))
-            elif data[3] >= 0.7:
-                conf_item.setForeground(QColor(PALETTE['accent_amber']))
-            else:
-                conf_item.setForeground(QColor(PALETTE['accent_green']))
-            self.db_table.setItem(row_idx, 3, conf_item)
-            self.current_db_paths.append(data[4])
+        alert_rows = self.db_engine.get_events("ALERT")
+        normal_rows = self.db_engine.get_events("NORMAL")
+        self._fill_event_table(self.db_table_alert, "ALERT", alert_rows)
+        self._fill_event_table(self.db_table_normal, "NORMAL", normal_rows)
+        self._lbl_db_count.setText(f"告警 {len(alert_rows)} 条 / 未告警 {len(normal_rows)} 条")
 
-        self._lbl_db_count.setText(f"{len(rows)} 条记录")
+    def _fill_event_table(self, table, event_type, rows):
+        table.setRowCount(len(rows))
+        self.current_db_paths[event_type] = []
+        for row_idx, data in enumerate(rows):
+            table.setItem(row_idx, 0, QTableWidgetItem(f"REC-{data[0]}"))
+            table.setItem(row_idx, 1, QTableWidgetItem(str(data[1])))
+            table.setItem(row_idx, 2, QTableWidgetItem(f"{data[2]:.0f} MHz"))
+            score_item = QTableWidgetItem(f"{data[3] * 100:.1f} %")
+            if event_type == "ALERT":
+                score_item.setForeground(QColor(PALETTE['accent_red']))
+            elif data[3] >= 0.75:
+                score_item.setForeground(QColor(PALETTE['accent_amber']))
+            else:
+                score_item.setForeground(QColor(PALETTE['accent_green']))
+            table.setItem(row_idx, 3, score_item)
+            table.setItem(row_idx, 4, QTableWidgetItem(str(data[5] or event_type)))
+            table.setItem(row_idx, 5, QTableWidgetItem(str(data[6] or "")))
+            self.current_db_paths[event_type].append(data[4])
 
     def on_db_row_selected(self):
-        selected = self.db_table.selectedItems()
+        if not hasattr(self, "event_tabs"):
+            return
+        table = self.db_table_alert if self.event_tabs.currentIndex() == 0 else self.db_table_normal
+        event_type = "ALERT" if table is self.db_table_alert else "NORMAL"
+        selected = table.selectedItems()
         if not selected:
             return
         row = selected[0].row()
-        img_path = self.current_db_paths[row]
+        if row >= len(self.current_db_paths.get(event_type, [])):
+            return
+        img_path = self.current_db_paths[event_type][row]
         cv_img = cv2.imread(img_path)
         if cv_img is not None:
             self.render_cv2_to_qlabel(cv_img, self.db_img_label)

@@ -152,7 +152,11 @@ class RFToolchain:
         )
 
         alert_flag = False
-        alert_info = {}
+        alert_info = {
+            "freq_mhz":   active_freq / 1e6,
+            "score":      audit_score,
+            "sds_detail": sds_detail,
+        }
 
         if confirm_flag:
             log_lines.append(

@@ -125,7 +125,7 @@ class CentralHubEngine(QObject):
             baudrate=cfg.RA8P1_LINK_BAUDRATE,
         )
         self.ra8p1_online = self.ra8p1_link.start()
-        self.db_engine = DBManager()
+        self.db_engine = DBManager(max_total_bytes=cfg.EVENT_DB_MAX_BYTES)
         self.diag_recorder = DiagnosticsRecorder(
             root_dir=os.path.join(PROJ_ROOT, cfg.DIAG_CAPTURE_ROOT),
             enabled=cfg.DIAG_CAPTURE_ENABLED,
@@ -147,6 +147,7 @@ class CentralHubEngine(QObject):
         self._calibration_thread = None
         self._calibration_running = False
         self._calibration_ok = False
+        self._last_normal_db_event_ts = 0.0
 
         # ── 时序持久化滤波器 v4.0（Tri-Level Elastic Confirmation TPF）──────────
         #
@@ -562,14 +563,15 @@ class CentralHubEngine(QObject):
         )
         
 
-    def _trigger_composite_save(self, reason_tag, freq_mhz, score):
+    def _build_composite_evidence(self, event_type, reason_tag, freq_mhz, score):
         """
-        生成射频证据图像并写入告警数据库。
+        生成射频证据图像。
 
         将当前射频频谱帧（cache_rf）与 RA8P1 裁决信息面板水平拼接，
-        叠加告警标注后，调用 DBManager 完成持久化存储。
+        叠加事件标注后，供 DBManager 持久化存储。
         """
         import cv2
+        event_type = str(event_type or "NORMAL").upper()
         panel = np.zeros((640, 640, 3), dtype=np.uint8)
         panel[:] = (12, 17, 28)
         cv2.putText(panel, "RA8P1 MASTER DECISION", (34, 70),
@@ -586,13 +588,70 @@ class CentralHubEngine(QObject):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (180, 180, 180), 2)
 
         fused_evidence = np.hstack([self.cache_rf, panel])
-        cv2.putText(fused_evidence, f"ALARM REASON: {reason_tag}", (20, 600), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-        
-        new_id = self.db_engine.log_alert(freq_mhz, score, fused_evidence)
-        self.signal_log.emit(f"持久化操作：事件证据标的 [REC-{new_id}] 标签属性 ({reason_tag}) 已完成写入。")
-        
+        color = (0, 80, 255) if event_type == "ALERT" else (80, 255, 120)
+        cv2.putText(
+            fused_evidence,
+            f"{event_type} REASON: {reason_tag}",
+            (20, 600),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            color,
+            2,
+        )
+        return fused_evidence
+
+    def _record_event_database_entry(self, event_type, reason_tag, freq_mhz, score, rf_info=None):
+        event_type = str(event_type or "NORMAL").upper()
+        rf_info = rf_info or {}
+        fused_evidence = self._build_composite_evidence(event_type, reason_tag, freq_mhz, score)
+        new_id = self.db_engine.log_event(
+            event_type=event_type,
+            freq_mhz=freq_mhz,
+            score=score,
+            bgr_image=fused_evidence,
+            final_decision=self.ra8p1_status.get("final_decision", ""),
+            reason=reason_tag,
+            rf_metrics=self._format_rf_metrics(rf_info),
+            metadata={
+                "ra8p1_status": dict(self.ra8p1_status),
+                "rf_info": rf_info,
+                "rf_confirm_streak": self._rf_confirm_streak,
+            },
+        )
+        self.signal_log.emit(
+            f"持久化操作：{event_type} 事件证据 [REC-{new_id}] 标签属性 ({reason_tag}) 已完成写入。"
+        )
+
         # 通知异步界面的前端模型重新加载历史缓存
         self.signal_db_updated.emit()
+
+    def _trigger_composite_save(self, reason_tag, freq_mhz, score):
+        self._record_event_database_entry(
+            event_type="ALERT",
+            reason_tag=reason_tag,
+            freq_mhz=freq_mhz,
+            score=score,
+            rf_info=self._rf_confirm_info,
+        )
+
+    def _maybe_record_normal_event(self, reason_tag, rf_info):
+        if not rf_info:
+            return
+        now = time.time()
+        sds_detail = rf_info.get("sds_detail", {}) or {}
+        sds_composite = float(sds_detail.get("composite", 0.0))
+        near_miss = sds_composite >= 0.75 or self._rf_confirm_streak > 0.0
+        if not near_miss and (now - self._last_normal_db_event_ts) < cfg.NORMAL_EVENT_LOG_PERIOD_SEC:
+            return
+
+        self._last_normal_db_event_ts = now
+        self._record_event_database_entry(
+            event_type="NORMAL",
+            reason_tag=reason_tag,
+            freq_mhz=float(rf_info.get("freq_mhz", 0.0)),
+            score=float(rf_info.get("score", 0.0)),
+            rf_info=rf_info,
+        )
 
     def _hub_loop(self):
         """
@@ -757,6 +816,10 @@ class CentralHubEngine(QObject):
                                 f"[RF-CANDIDATE] RF 本地已确认，但 RA8P1 当前裁决为 "
                                 f"{final_decision}：{decision_reason}"
                             )
+                            self._maybe_record_normal_event(
+                                f"RA8P1_NOT_ALERT:{decision_reason}",
+                                self._rf_confirm_info,
+                            )
                         # 不重置 streak，维持告警状态直到信号消失
 
                 else:
@@ -792,6 +855,12 @@ class CentralHubEngine(QObject):
                         "rf_progress": rf_progress,
                         "rf_metrics": self._format_rf_metrics(rf_info),
                     })
+                    normal_reason = (
+                        "RF_CANDIDATE_NOT_CONFIRMED"
+                        if self._rf_confirm_streak > 0
+                        else "RF_SCAN_CLEAR"
+                    )
+                    self._maybe_record_normal_event(normal_reason, rf_info)
 
             except Exception as e:
                 self.signal_log.emit(f"SDR 射频传感器寻址异常: {e}")

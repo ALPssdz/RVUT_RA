@@ -48,4 +48,10 @@ DIAG_SAVE_IQ             = True
 DIAG_MAX_IQ_SAMPLES      = 524288   # 保存约 13 ms IQ，降低现场记录阻塞和磁盘占用
 DIAG_MAX_EVENT_RECORDS   = 200      # 防止现场长时间运行写满磁盘
 DIAG_MAX_CAPTURE_ROOT_BYTES = 2 * 1024 * 1024 * 1024  # diagnostics/captures 总大小上限：2GB
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 告警/未告警证据库
+# ──────────────────────────────────────────────────────────────────────────────
+EVENT_DB_MAX_BYTES       = 5 * 1024 * 1024 * 1024  # database/ 总大小上限：5GB
+NORMAL_EVENT_LOG_PERIOD_SEC = 5.0                  # 未告警普通扫描快照最小写入间隔
  
