@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-UART protocol helpers for the RA8P1 master link.
+Line protocol helpers for the RA8P1 master link.
 
-Initial transport format: one compact JSON object per line.
-The checksum is intentionally simple for bring-up; replace with CRC16 before
-field deployment if the line protocol remains in use.
+Physical transport on CPKHMI-RA8P1: RA8P1 SCI9 is connected to the on-board
+SEGGER J-Link OB virtual COM port. RK3588 normally sees it as /dev/ttyACM0.
+The same line protocol also works with pseudo terminals for simulation.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict
 
 
-DEFAULT_BAUDRATE = 921600
+DEFAULT_BAUDRATE = 2000000
 ROLE_AGENT = "RK3588_RF_AGENT"
 ROLE_MASTER = "RA8P1_MASTER"
 
@@ -64,6 +64,14 @@ class RA8P1Protocol:
             "timestamp_ms": int(time.time() * 1000),
         }
 
+    def agent_ready(self) -> Dict[str, Any]:
+        return {
+            "type": "AGENT_READY",
+            "seq": self.seq.next(),
+            "role": self.role,
+            "timestamp_ms": int(time.time() * 1000),
+        }
+
     def detection_report(
         self,
         freq_mhz: float,
@@ -80,6 +88,7 @@ class RA8P1Protocol:
             "sds": round(float(sds), 6),
             "rf_detected": bool(rf_detected),
             "suggestion": suggestion,
+            "timestamp_ms": int(time.time() * 1000),
         }
 
     def master_decision(self, decision: str, reason: str) -> Dict[str, Any]:
@@ -88,5 +97,5 @@ class RA8P1Protocol:
             "seq": self.seq.next(),
             "decision": decision,
             "reason": reason,
+            "timestamp_ms": int(time.time() * 1000),
         }
-

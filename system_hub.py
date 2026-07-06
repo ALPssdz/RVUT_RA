@@ -4,6 +4,7 @@ import os
 import time
 import threading
 import numpy as np
+from typing import Optional
 
 # Optional preload: on some Windows/PyQt5 environments importing torch before Qt
 # avoids C++ runtime initialization failures. RKNN deployments may not ship torch.
@@ -25,6 +26,8 @@ from backend_rk3588 import config as cfg
 from backend_rk3588.main_rf_pipeline import RFToolchain
 from ui_qt.gui_host import MainWindow
 from database.db_manager import DBManager
+from protocol.ra8p1_link import RA8P1Link
+from diagnostics.recorder import DiagnosticsRecorder
 
 
 # ==============================================================================
@@ -103,12 +106,12 @@ class CentralHubEngine(QObject):
     系统级中央调度引擎（Central Orchestration Engine）
 
     基于事件总线（Event Bus）架构，负责协调射频检测子系统、RA8P1 主控
-    裁决链路与 HDMI 大屏上位机，将告警事件持久化写入数据库，并通过
+    裁决链路与 HDMI 大屏显示终端，将告警事件持久化写入数据库，并通过
     Qt 信号机制向 GUI 表现层广播实时状态。
 
     子系统组成：
       - RFToolchain   : 三级射频检测流水线（S1-RSSI / S2-YOLO / S3-CycloAudit）
-      - RA8P1 Link    : UART 主控链路（RA8P1 负责最终裁决）
+      - RA8P1 Link    : JDBG VCOM / SCI9 主控链路（RA8P1 负责最终裁决）
       - DBManager     : SQLite 告警事件持久化引擎
       - MainWindow    : PyQt5 GUI 表现层
     """
@@ -116,7 +119,7 @@ class CentralHubEngine(QObject):
     signal_log = pyqtSignal(str)
     signal_system_status = pyqtSignal(dict)
     signal_db_updated = pyqtSignal()
-    # 标定完成通知：True=成功，False=出错（两种情况均允许启动，但告知状态）
+    # 标定完成通知：True=成功，False=出错；正式模式下失败不允许启动检测
     signal_calibration_done = pyqtSignal(bool)
     
     def __init__(self):
@@ -124,11 +127,33 @@ class CentralHubEngine(QObject):
         
         # 初始化各子系统节点
         self.rf_toolchain = RFToolchain()
+        self.ra8p1_link = RA8P1Link(
+            port=cfg.RA8P1_LINK_PORT,
+            baudrate=cfg.RA8P1_LINK_BAUDRATE,
+        )
+        self.ra8p1_online = self.ra8p1_link.start()
         self.db_engine = DBManager()
+        self.diag_recorder = DiagnosticsRecorder(
+            root_dir=os.path.join(PROJ_ROOT, cfg.DIAG_CAPTURE_ROOT),
+            enabled=cfg.DIAG_CAPTURE_ENABLED,
+            save_iq=cfg.DIAG_SAVE_IQ,
+            max_iq_samples=cfg.DIAG_MAX_IQ_SAMPLES,
+            max_event_records=cfg.DIAG_MAX_EVENT_RECORDS,
+            max_root_bytes=cfg.DIAG_MAX_CAPTURE_ROOT_BYTES,
+        )
+        self.signal_log.connect(self._record_runtime_log)
 
         self.running        = False
         self._master_thread = None
+        self._control_alive = True
+        self._ra8p1_control_thread = None
         self._tick_lock     = threading.Lock()  # 防止 tick() 在 stop/start 切换时重入
+        self._last_heartbeat_ts = 0.0
+        self._last_master_seq = None
+        self._ra8p1_scan_authorized = False
+        self._calibration_thread = None
+        self._calibration_running = False
+        self._calibration_ok = False
 
         # ── 时序持久化滤波器 v4.0（Tri-Level Elastic Confirmation TPF）──────────
         #
@@ -167,29 +192,105 @@ class CentralHubEngine(QObject):
         # RF 最新帧缓存（供证据图生成使用）
         self.cache_rf  = np.zeros((640, 640, 3),  dtype=np.uint8)
         self.ra8p1_status = {
-            "link": "UART 921600  ·  待接入",
-            "decision": "PENDING",
-            "reason": "RF Agent local fallback",
+            "link": self.ra8p1_link.summary(),
+            "raw_decision": "PENDING",
+            "raw_reason": "等待 RA8P1 回包",
+            "final_decision": "PENDING",
+            "final_reason": "等待 RA8P1 START_SCAN 与 RF 证据",
+            "rf_progress": "未开始",
+            "rf_metrics": "Freq -- | NCC -- | SDS --",
         }
 
         # 实例化 GUI 表现层并注入中央事件总线引用
         self.ui_window = MainWindow(hub=self)
         self.signal_log.emit("系统初始化完成：各子系统节点已就绪，中央事件路由建立。")
+        if cfg.DIAG_CAPTURE_ENABLED:
+            self.signal_log.emit(f"误报诊断记录已启用：{self.diag_recorder.session_dir}")
+        if self.ra8p1_online:
+            self.signal_log.emit(f"RA8P1 主控链路已连接：{self.ra8p1_link.summary()}")
+        else:
+            mode_text = "系统锁定，等待 RA8P1 主控接入。" if cfg.RA8P1_REQUIRED else "启用 RF 本地降级模式。"
+            self.signal_log.emit(f"RA8P1 主控链路未接入：{self.ra8p1_link.summary()}，{mode_text}")
 
-    def start_sensing(self):
-        if self.running: return
+        self._ra8p1_control_thread = threading.Thread(target=self._ra8p1_control_loop, daemon=True)
+        self._ra8p1_control_thread.start()
+
+    def start_sensing(self, source: str = "local") -> bool:
+        if self.running:
+            return True
+        if not self.ra8p1_link.online:
+            self.ra8p1_online = self.ra8p1_link.start()
+        if source == "ra8p1":
+            self._ra8p1_scan_authorized = True
+        if self._calibration_running:
+            self.signal_system_status.emit({
+                "system": "系统模式: [标定中] 等待标定完成",
+                "color": "#f1c40f",
+                "ra8p1": self.ra8p1_link.summary(),
+                "final_decision": self.ra8p1_status.get("final_decision", "PENDING"),
+                "final_reason": "RA8P1 START_SCAN 已记录，标定完成后自动放行采集",
+                "rf_progress": "标定中",
+                "pipeline_running": False,
+            })
+            self.signal_log.emit(f"采集启动延后：source={source}，当前正在执行背景标定。")
+            return False
+        if cfg.FORCE_CALIBRATION_REQUIRED and not self._calibration_ok:
+            self.signal_system_status.emit({
+                "system": "系统模式: [强制标定锁定]",
+                "color": "#f1c40f",
+                "ra8p1": self.ra8p1_link.summary(),
+                "final_decision": "PENDING",
+                "final_reason": "正式模式要求背景标定成功后才允许启动检测",
+                "rf_progress": "等待强制标定",
+                "pipeline_running": False,
+            })
+            self.signal_log.emit(
+                f"采集管道未启动：FORCE_CALIBRATION_REQUIRED=True，当前背景标定未成功。source={source}"
+            )
+            return False
+        if cfg.RA8P1_REQUIRED and not self.ra8p1_link.online:
+            self.signal_system_status.emit({
+                "system": "系统模式: [锁定] RA8P1 主控未接入",
+                "color": "#f1c40f",
+                "ra8p1": self.ra8p1_link.summary(),
+                "final_decision": "PENDING",
+                "final_reason": "RA8P1_REQUIRED=True，等待 JDBG VCOM 主控链路接入",
+                "rf_progress": "链路未接入",
+            })
+            self.signal_log.emit(
+                f"采集管道未启动：RA8P1_REQUIRED=True，但主控链路未接入：{self.ra8p1_link.summary()}"
+            )
+            return False
+        if cfg.RA8P1_REQUIRED and source != "ra8p1":
+            self.signal_system_status.emit({
+                "system": "系统模式: [主控锁定] 等待 RA8P1 START_SCAN",
+                "color": "#f1c40f",
+                "ra8p1": self.ra8p1_link.summary(),
+                "final_decision": self.ra8p1_status.get("final_decision", "PENDING"),
+                "final_reason": "正式模式下采集只能由 RA8P1 主控授权启动",
+                "rf_progress": "等待主控启动",
+                "pipeline_running": False,
+            })
+            self.signal_log.emit("本地启动请求被拒绝：正式模式要求 RA8P1 下发 START_SCAN。")
+            return False
+
         self.running = True
         self.signal_system_status.emit({
             "system": "[ACTIVE] 主管道全速轮询中...", 
             "color": "#27ae60",
             "sdr": "SDR 节点: [RX] IQ 数据采集中",
-            "ra8p1": "RA8P1 主控: UART 921600 待接入",
-            "master_decision": "CLEAR",
-            "decision_reason": "RF Agent 本地扫描中，等待 RA8P1 主控裁决链路接入",
+            "ra8p1": self.ra8p1_link.summary(),
+            "final_decision": "CLEAR",
+            "final_reason": "RF Agent 扫描中，尚无最终告警",
+            "rf_progress": "扫描中",
+            "ra8p1_raw_decision": self.ra8p1_status.get("raw_decision", "PENDING"),
+            "ra8p1_raw_reason": self.ra8p1_status.get("raw_reason", "等待 RA8P1 回包"),
+            "pipeline_running": True,
         })
-        self.signal_log.emit("采集管道启动：SDR 前端已进入工作状态，RA8P1 UART 主控链路待接入。")
+        self.signal_log.emit(f"采集管道启动：source={source}，SDR 前端已进入工作状态，RA8P1 主控链路状态已同步。")
         self._master_thread = threading.Thread(target=self._hub_loop, daemon=True)
         self._master_thread.start()
+        return True
         
     def _get_bypass_threshold(self, freq_mhz: float) -> float:
         """
@@ -224,16 +325,257 @@ class CentralHubEngine(QObject):
         # 回退：使用硬编码下限（1.8% × 3.0 = 5.4%）
         return 0.018 * self.RF_STRONG_BYPASS_RATIO
 
-    def stop_sensing(self):
+    def _record_runtime_log(self, text: str):
+        try:
+            self.diag_recorder.log_text(text)
+        except Exception:
+            pass
+
+    def _current_iq_buffer(self):
+        try:
+            return self.rf_toolchain.stage2_vision.last_buffer_iq
+        except Exception:
+            return None
+
+    def _format_rf_metrics(self, rf_info: dict) -> str:
+        if not rf_info:
+            return "Freq -- | NCC -- | SDS -- | YOLO --"
+        sds_detail = rf_info.get("sds_detail", {}) or {}
+        freq = float(rf_info.get("freq_mhz", 0.0))
+        ncc = float(rf_info.get("score", 0.0))
+        sds = float(sds_detail.get("composite", 0.0))
+        yolo = float(rf_info.get("yolo_score", 0.0))
+        freq_text = f"{freq:.0f} MHz" if freq > 0 else "--"
+        return f"Freq {freq_text} | NCC {ncc*100:.2f}% | SDS {sds:.3f} | YOLO {yolo:.2f}"
+
+    def _record_rf_diagnostic_event(
+        self,
+        event_type: str,
+        rf_alert: bool,
+        rf_info: dict,
+        rf_log: str,
+        frame_bgr,
+        extra: Optional[dict] = None,
+        save_iq: bool = True,
+    ):
+        if not cfg.DIAG_CAPTURE_ENABLED:
+            return
+        metadata = {
+            "cycle": getattr(self.rf_toolchain, "cycle_count", None),
+            "rf_alert": bool(rf_alert),
+            "rf_info": rf_info or {},
+            "ra8p1_link": self.ra8p1_link.summary(),
+            "ra8p1_last_decision": dict(self.ra8p1_link.last_decision or {}),
+            "ra8p1_status": dict(self.ra8p1_status),
+            "rf_confirm_streak": self._rf_confirm_streak,
+            "rf_log": rf_log,
+            "config": {
+                "sdr_uri": cfg.SDR_URI,
+                "sdr_gain_db": cfg.SDR_GAIN_DB,
+                "sample_rate": cfg.SAMPLE_RATE,
+                "yolo_assist_enabled": cfg.YOLO_ASSIST_ENABLED,
+                "ra8p1_required": cfg.RA8P1_REQUIRED,
+            },
+        }
+        if extra:
+            metadata.update(extra)
+
+        self.diag_recorder.record_event(
+            event_type=event_type,
+            metadata=metadata,
+            frame_bgr=frame_bgr,
+            iq_buffer=self._current_iq_buffer() if save_iq else None,
+        )
+
+    def stop_sensing(self, source: str = "local") -> bool:
         self.running = False
-        self.ra8p1_status["decision"] = "PENDING"
+        if source == "ra8p1":
+            self._ra8p1_scan_authorized = False
+        self.ra8p1_status["final_decision"] = "PENDING"
+        self.ra8p1_status["final_reason"] = "采集管道已停止"
+        self.ra8p1_status["rf_progress"] = "已停止"
+        self.ra8p1_status["link"] = self.ra8p1_link.summary()
         self.signal_system_status.emit({
             "system": "系统模式: [挂起] 任务挂起",
             "color": "#f1c40f",
-            "master_decision": "PENDING",
-            "decision_reason": "采集管道已停止",
+            "ra8p1": self.ra8p1_status["link"],
+            "final_decision": "PENDING",
+            "final_reason": "采集管道已停止",
+            "rf_progress": "已停止",
+            "pipeline_running": False,
         })
-        self.signal_log.emit("系统中央主循环进程已安全退出执行。")
+        self.signal_log.emit(f"系统中央主循环进程已安全退出执行。source={source}")
+        return True
+
+    def _pump_ra8p1_messages(self):
+        """Drain RA8P1 serial messages and reflect master state in the GUI."""
+        for msg in self.ra8p1_link.poll():
+            msg_type = msg.get("type", "")
+            self.ra8p1_status["link"] = self.ra8p1_link.summary()
+            if msg_type == "MASTER_DECISION":
+                decision = msg.get("decision", "PENDING")
+                reason = msg.get("reason", "")
+                self.ra8p1_status["raw_decision"] = decision
+                self.ra8p1_status["raw_reason"] = reason
+                self.signal_log.emit(
+                    f"[RA8P1] MASTER_DECISION: {decision} ({reason})"
+                )
+                self.signal_system_status.emit({
+                    "ra8p1": self.ra8p1_link.summary(),
+                    "ra8p1_raw_decision": decision,
+                    "ra8p1_raw_reason": reason,
+                })
+                if decision in {"CANDIDATE", "ALERT"}:
+                    self._record_rf_diagnostic_event(
+                        event_type=f"ra8p1_{decision.lower()}",
+                        rf_alert=(decision == "ALERT"),
+                        rf_info=self._rf_confirm_info,
+                        rf_log="",
+                        frame_bgr=self.cache_rf,
+                        extra={"ra8p1_message": msg},
+                        save_iq=(decision == "ALERT"),
+                    )
+            elif msg_type in {"START_SCAN", "STOP_SCAN", "RESET_ALERT", "GET_STATUS", "RUN_CALIBRATION"}:
+                self._handle_ra8p1_command(msg)
+            elif msg_type:
+                self.signal_log.emit(f"[RA8P1] RX {msg_type}: {msg}")
+
+    def _handle_ra8p1_command(self, msg: dict):
+        msg_type = msg.get("type", "")
+        seq = msg.get("seq")
+        if seq is not None and seq == self._last_master_seq:
+            return
+        self._last_master_seq = seq
+
+        if msg_type == "START_SCAN":
+            self._ra8p1_scan_authorized = True
+            if not self.running:
+                self.signal_log.emit(f"[RA8P1] CMD START_SCAN: {msg}")
+                self.start_sensing(source="ra8p1")
+            else:
+                self.ra8p1_status["link"] = self.ra8p1_link.summary()
+            return
+
+        self.signal_log.emit(f"[RA8P1] CMD {msg_type}: {msg}")
+        if msg_type == "STOP_SCAN":
+            self._ra8p1_scan_authorized = False
+            self.stop_sensing(source="ra8p1")
+        elif msg_type == "RESET_ALERT":
+            self._rf_confirm_streak = 0.0
+            self._rf_confirm_info = {}
+            self.ra8p1_status["final_decision"] = "CLEAR"
+            self.ra8p1_status["final_reason"] = "RA8P1 RESET_ALERT 已清除本地告警状态"
+            self.ra8p1_status["raw_decision"] = "CLEAR"
+            self.ra8p1_status["raw_reason"] = "RESET_ALERT"
+            self.signal_system_status.emit({
+                "ra8p1": self.ra8p1_link.summary(),
+                "final_decision": "CLEAR",
+                "final_reason": "RA8P1 RESET_ALERT 已清除本地告警状态",
+                "ra8p1_raw_decision": "CLEAR",
+                "ra8p1_raw_reason": "RESET_ALERT",
+            })
+        elif msg_type == "GET_STATUS":
+            self.signal_system_status.emit({
+                "ra8p1": self.ra8p1_link.summary(),
+                "final_decision": self.ra8p1_status.get("final_decision", "PENDING"),
+                "final_reason": self.ra8p1_status.get("final_reason", "状态已同步"),
+                "ra8p1_raw_decision": self.ra8p1_status.get("raw_decision", "PENDING"),
+                "ra8p1_raw_reason": self.ra8p1_status.get("raw_reason", "等待 RA8P1 回包"),
+            })
+        elif msg_type == "RUN_CALIBRATION":
+            self.signal_log.emit("[RA8P1] RUN_CALIBRATION 已收到；停止采集并由 RA8P1 授权启动标定。")
+            if self.running:
+                self.stop_sensing(source="ra8p1")
+            self.request_calibration(source="ra8p1")
+
+    def request_calibration(self, source: str = "local") -> bool:
+        if cfg.RA8P1_REQUIRED and source not in {"ra8p1", "system_boot"}:
+            self.signal_log.emit("本地标定请求被拒绝：正式模式要求 RA8P1 或系统启动流程授权。")
+            return False
+        if self._calibration_thread and self._calibration_thread.is_alive():
+            self.signal_log.emit("标定请求忽略：后台标定任务已经在运行。")
+            return False
+
+        self._calibration_running = True
+        self._calibration_ok = False
+        self._calibration_thread = threading.Thread(
+            target=self._calibration_worker,
+            args=(source,),
+            daemon=True,
+        )
+        self._calibration_thread.start()
+        return True
+
+    def _calibration_worker(self, source: str):
+        self.signal_log.emit("=" * 58)
+        self.signal_log.emit(f"  [RF-Vision] 后台执行 S3 CAF-FFT 环境底噪校准，source={source}")
+        self.signal_log.emit("  强制标定模式：标定成功前禁止启动检测；采集仍由 RA8P1 START_SCAN 放行")
+        self.signal_log.emit("=" * 58)
+        ok = True
+        try:
+            from rf_zynq.calibrate_s3 import main as calibrate
+            calibrate()
+            self.signal_log.emit("  [RF-Vision] 强制背景标定完成，新阈值已生效。")
+        except Exception as exc:
+            ok = False
+            self.signal_log.emit(f"  [RF-Vision] 标定出错: {exc}")
+            self.signal_log.emit("  -> 强制标定失败，检测管道保持锁定，不使用旧阈值启动。")
+        finally:
+            self._calibration_running = False
+            self._calibration_ok = ok
+            self.signal_calibration_done.emit(ok)
+            if ok and cfg.RA8P1_REQUIRED and self._ra8p1_scan_authorized and self.ra8p1_link.online:
+                self.signal_log.emit("标定完成：检测到 RA8P1 START_SCAN 授权，自动启动采集。")
+                self.start_sensing(source="ra8p1")
+
+    def _maybe_send_ra8p1_heartbeat(self):
+        now = time.time()
+        if now - self._last_heartbeat_ts >= 1.0:
+            self.ra8p1_link.send_heartbeat()
+            self._last_heartbeat_ts = now
+
+    def _ra8p1_control_loop(self):
+        """
+        常驻 RA8P1 主控监听线程。
+
+        采集管道未启动时也要处理 START_SCAN / STOP_SCAN / RESET_ALERT 等主控命令，
+        否则 RA8P1 已经发出启动指令但 Hub 仍停留在待机界面。采集线程运行后，
+        该线程继续负责轻量心跳和离线重连；检测报告仍由 RF 采集循环发送。
+        """
+        last_reconnect_ts = 0.0
+        while self._control_alive:
+            now = time.time()
+            if not self.ra8p1_link.online and now - last_reconnect_ts >= 2.0:
+                self.ra8p1_online = self.ra8p1_link.start()
+                last_reconnect_ts = now
+                if self.ra8p1_online:
+                    self.signal_log.emit(f"RA8P1 主控链路已恢复：{self.ra8p1_link.summary()}")
+
+            if self.ra8p1_link.online:
+                self._maybe_send_ra8p1_heartbeat()
+                self._pump_ra8p1_messages()
+
+            time.sleep(0.05)
+
+    def _send_ra8p1_detection_report(self, rf_alert: bool, rf_info: dict):
+        if not self.ra8p1_link.online or not rf_info:
+            return
+        sds_detail = rf_info.get("sds_detail", {}) if rf_info else {}
+        sds_score = float(sds_detail.get("composite", 0.0))
+        freq_mhz = float(rf_info.get("freq_mhz", 0.0))
+        ncc = float(rf_info.get("score", 0.0))
+        suggestion = "ALERT" if rf_alert else "CLEAR"
+        if not rf_alert and rf_info.get("yolo_only"):
+            suggestion = "CANDIDATE"
+        if rf_alert:
+            self.ra8p1_link.last_decision = {}
+        self.ra8p1_link.send_detection_report(
+            freq_mhz=freq_mhz,
+            ncc=ncc,
+            sds=sds_score,
+            rf_detected=bool(rf_alert),
+            suggestion=suggestion,
+        )
         
 
     def _trigger_composite_save(self, reason_tag, freq_mhz, score):
@@ -248,7 +590,7 @@ class CentralHubEngine(QObject):
         panel[:] = (12, 17, 28)
         cv2.putText(panel, "RA8P1 MASTER DECISION", (34, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 210, 255), 2)
-        cv2.putText(panel, f"Decision : {self.ra8p1_status.get('decision', 'PENDING')}", (34, 145),
+        cv2.putText(panel, f"Final    : {self.ra8p1_status.get('final_decision', 'PENDING')}", (34, 145),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.82, (80, 255, 120), 2)
         cv2.putText(panel, f"Reason   : {reason_tag}", (34, 205),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2)
@@ -256,7 +598,7 @@ class CentralHubEngine(QObject):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2)
         cv2.putText(panel, f"Score    : {score:.4f}", (34, 325),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2)
-        cv2.putText(panel, f"Link     : {self.ra8p1_status.get('link', 'UART 921600')}", (34, 385),
+        cv2.putText(panel, f"Link     : {self.ra8p1_status.get('link', 'JDBG UART /dev/ttyACM0')}", (34, 385),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (180, 180, 180), 2)
 
         fused_evidence = np.hstack([self.cache_rf, panel])
@@ -274,8 +616,8 @@ class CentralHubEngine(QObject):
 
         管线一（RF）：调用 RFToolchain.tick() 执行一次三级检测周期，
                       处理告警结果并更新 GUI 状态。
-        RA8P1 主控裁决链路将在后续阶段接入：当前版本保留 RF 本地确认
-        作为过渡路径，并在上位机明确标注 RA8P1 UART 待接入。
+        RA8P1 主控裁决链路通过 JDBG VCOM / SCI9 接入。比赛默认配置要求
+        RA8P1 在线，RF Agent 只负责外置算力检测与结果上报。
         """
         while self.running:
             # === [处理管线一：软件无线电跳频解调] ===
@@ -330,9 +672,36 @@ class CentralHubEngine(QObject):
                             rf_info = {}
                         rf_info["score"] = sds_final  # 用修正后的综合分替代原始 NCC
 
+                self._send_ra8p1_detection_report(rf_alert, rf_info)
+                self._pump_ra8p1_messages()
+                if rf_info:
+                    sds_detail = rf_info.get("sds_detail", {}) if rf_info else {}
+                    sds_composite = float(sds_detail.get("composite", 0.0))
+                    should_capture = (
+                        rf_alert
+                        or rf_info.get("yolo_only")
+                        or sds_composite >= 0.75
+                    )
+                    if should_capture:
+                        if rf_alert:
+                            event_type = "rf_s3_pass"
+                        elif rf_info.get("yolo_only"):
+                            event_type = "rf_yolo_only"
+                        else:
+                            event_type = "rf_sds_near_miss"
+                        self._record_rf_diagnostic_event(
+                            event_type=event_type,
+                            rf_alert=rf_alert,
+                            rf_info=rf_info,
+                            rf_log=rf_log,
+                            frame_bgr=rf_frame,
+                            save_iq=bool(rf_alert),
+                        )
+
                 if rf_alert:
                     freq_mhz  = rf_info.get("freq_mhz", 0.0)
                     score     = rf_info.get("score",    0.0)
+                    rf_metrics = self._format_rf_metrics(rf_info)
                     bypass_th = self._get_bypass_threshold(freq_mhz)
                     med_th    = bypass_th / self.RF_STRONG_BYPASS_RATIO * self.RF_MED_BYPASS_RATIO
 
@@ -345,6 +714,7 @@ class CentralHubEngine(QObject):
                             f"[RF-PRE] 强信号直通（N=1）"
                             f" @ {freq_mhz:.0f} MHz  "
                             f"NCC={score*100:.2f}%（≥ {bypass_th*100:.2f}% 旁路阈值）")
+                        rf_progress = f"RF 强证据确认 {self._rf_confirm_streak:.1f}/{n_required}"
                     elif score >= med_th:
                         # ── 分支 B：中等信号（N=2）────────────────────────────
                         n_required = 2
@@ -358,6 +728,7 @@ class CentralHubEngine(QObject):
                             f"[RF-PRE] 中等信号（N=2）({streak:.1f}/{n_required})"
                             f" @ {freq_mhz:.0f} MHz  "
                             f"NCC={score*100:.1f}%")
+                        rf_progress = f"RF 中等证据确认 {streak:.1f}/{n_required}"
                     else:
                         # ── 分支 C：弱信号（N=3）──────────────────────────────
                         n_required = 3
@@ -371,31 +742,68 @@ class CentralHubEngine(QObject):
                             f"[RF-PRE] 弱信号（N=3）({streak:.1f}/{n_required})"
                             f" @ {freq_mhz:.0f} MHz  "
                             f"NCC={score*100:.1f}%  等待第 {n_required} 次确认...")
+                        rf_progress = f"RF 弱证据确认 {streak:.1f}/{n_required}"
+
+                    self.ra8p1_status["rf_progress"] = rf_progress
+                    self.ra8p1_status["rf_metrics"] = rf_metrics
+                    self.signal_system_status.emit({
+                        "ra8p1": self.ra8p1_link.summary(),
+                        "final_decision": self.ra8p1_status.get("final_decision", "CLEAR"),
+                        "final_reason": self.ra8p1_status.get("final_reason", "尚未形成最终告警"),
+                        "ra8p1_raw_decision": self.ra8p1_status.get("raw_decision", "PENDING"),
+                        "ra8p1_raw_reason": self.ra8p1_status.get("raw_reason", "等待 RA8P1 回包"),
+                        "rf_progress": rf_progress,
+                        "rf_metrics": rf_metrics,
+                    })
 
                     if self._rf_confirm_streak >= n_required:
                         # 达标 → 发出最终告警
-                        self.ra8p1_status["decision"] = "ALERT"
-                        self.ra8p1_status["reason"] = f"RF_LOCAL_CONFIRMED_N{n_required}"
+                        decision_reason = f"RF_LOCAL_CONFIRMED_N{n_required}"
+                        final_decision = "ALERT"
+                        if self.ra8p1_link.online and self.ra8p1_link.last_decision:
+                            final_decision = self.ra8p1_link.last_decision.get("decision", "CANDIDATE")
+                            decision_reason = self.ra8p1_link.last_decision.get("reason", decision_reason)
+                        elif self.ra8p1_link.online:
+                            final_decision = "CANDIDATE"
+                            decision_reason = "等待 RA8P1 MASTER_DECISION"
+
+                        display_final = "ALERT" if final_decision == "ALERT" else "CLEAR"
+                        final_reason = (
+                            decision_reason
+                            if final_decision == "ALERT"
+                            else f"RF已达本地确认，但RA8P1未给出最终告警：{decision_reason}"
+                        )
+                        self.ra8p1_status["link"] = self.ra8p1_link.summary()
+                        self.ra8p1_status["final_decision"] = display_final
+                        self.ra8p1_status["final_reason"] = final_reason
                         self.signal_system_status.emit({
-                            "system": "[!] Alert: OcuSync RF Detected!",
-                            "color":  "#e74c3c",
-                            "alert":  True,
-                            "master_decision": "ALERT",
-                            "decision_reason": (
-                                f"过渡模式：RF 本地确认 N={n_required}；"
-                                "RA8P1 UART 接入后由主控返回最终裁决"
-                            ),
+                            "system": "[!] Alert: OcuSync RF Detected!" if final_decision == "ALERT" else "RA8P1 主控未确认最终告警",
+                            "color":  "#e74c3c" if final_decision == "ALERT" else "#f1c40f",
+                            "alert":  final_decision == "ALERT",
+                            "ra8p1": self.ra8p1_link.summary(),
+                            "final_decision": display_final,
+                            "final_reason": final_reason,
+                            "ra8p1_raw_decision": self.ra8p1_status.get("raw_decision", "PENDING"),
+                            "ra8p1_raw_reason": self.ra8p1_status.get("raw_reason", "等待 RA8P1 回包"),
+                            "rf_progress": rf_progress,
+                            "rf_metrics": rf_metrics,
                         })
                         freq      = self._rf_confirm_info.get("freq_mhz", 0.0)
                         score_out = self._rf_confirm_info.get("score",    0.0)
                         yolo_out  = self._rf_confirm_info.get("yolo_score", 0.0)
                         yolo_tag  = f"  YOLO={yolo_out:.2f}" if yolo_out > 0 else ""
-                        self.signal_log.emit(
-                            f'<span style="color:#ef4444; font-weight:bold;">'
-                            f'⚠ [RF-ALARM] OcuSync 无人机信号已确认（N={n_required}）！'
-                            f' @ {freq:.0f} MHz  NCC={score_out*100:.2f}%{yolo_tag}'
-                            f' — 告警已入库，证据图像正在写入...</span>')
-                        self._trigger_composite_save("SDR_OMNI_TRIGGER", freq, score_out)
+                        if final_decision == "ALERT":
+                            self.signal_log.emit(
+                                f'<span style="color:#ef4444; font-weight:bold;">'
+                                f'⚠ [RF-ALARM] RA8P1 主控确认 OcuSync 告警（N={n_required}）！'
+                                f' @ {freq:.0f} MHz  NCC={score_out*100:.2f}%{yolo_tag}'
+                                f' — 告警已入库，证据图像正在写入...</span>')
+                            self._trigger_composite_save("SDR_RA8P1_MASTER_TRIGGER", freq, score_out)
+                        else:
+                            self.signal_log.emit(
+                                f"[RF-CANDIDATE] RF 本地已确认，但 RA8P1 当前裁决为 "
+                                f"{final_decision}：{decision_reason}"
+                            )
                         # 不重置 streak，维持告警状态直到信号消失
 
                 else:
@@ -414,23 +822,39 @@ class CentralHubEngine(QObject):
                             f"({prev_streak:.1f} → {self._rf_confirm_streak:.1f})")
                     freq_display = rf_info.get('freq_mhz', 0) if rf_info else 0
                     if self._rf_confirm_streak <= 0:
-                        self.ra8p1_status["decision"] = "CLEAR"
+                        self.ra8p1_status["final_decision"] = "CLEAR"
+                        self.ra8p1_status["final_reason"] = "RF 未确认告警，持续扫描"
+                        self.ra8p1_status["rf_progress"] = "扫描中"
+                        self.ra8p1_status["rf_metrics"] = self._format_rf_metrics(rf_info)
+                    self.ra8p1_status["link"] = self.ra8p1_link.summary()
+                    rf_progress = "扫描中" if self._rf_confirm_streak <= 0 else f"RF 候选目标确认中 {self._rf_confirm_streak:.1f}/3"
                     self.signal_system_status.emit({
                         "system": f"系统状态: [扫描] ({freq_display:.0f}MHz)" if freq_display else "系统状态: 主管道全速扫描中...",
                         "color": "#27ae60",
-                        "master_decision": "CLEAR" if self._rf_confirm_streak <= 0 else "CANDIDATE",
-                        "decision_reason": "RF 未确认告警，持续扫描" if self._rf_confirm_streak <= 0 else "RF 候选目标确认中",
+                        "ra8p1": self.ra8p1_link.summary(),
+                        "final_decision": "CLEAR",
+                        "final_reason": "RF 未确认告警，持续扫描" if self._rf_confirm_streak <= 0 else "RF 候选目标确认中，未形成最终告警",
+                        "ra8p1_raw_decision": self.ra8p1_status.get("raw_decision", "PENDING"),
+                        "ra8p1_raw_reason": self.ra8p1_status.get("raw_reason", "等待 RA8P1 回包"),
+                        "rf_progress": rf_progress,
+                        "rf_metrics": self._format_rf_metrics(rf_info),
                     })
 
             except Exception as e:
                 self.signal_log.emit(f"SDR 射频传感器寻址异常: {e}")
             finally:
                 self._tick_lock.release()
-                
+
+            self._maybe_send_ra8p1_heartbeat()
+            self._pump_ra8p1_messages()
             time.sleep(0.001)  # 1ms 让出 CPU 给 Qt 事件循环，避免 UI 卡顿
 
     def shutdown(self):
+        self._control_alive = False
         self.stop_sensing()
+        if self._ra8p1_control_thread:
+            self._ra8p1_control_thread.join(timeout=0.5)
+        self.ra8p1_link.stop()
 
 if __name__ == "__main__":
     # ── Step 1: 安装 stdout 重定向器 ──────────────────────────────────────────
@@ -452,27 +876,8 @@ if __name__ == "__main__":
     _redirector.attach_signal(hub.signal_log.emit)
 
     # ── Step 4: 后台线程执行环境底噪校准（非阻塞，GUI 保持响应）─────────────
-    # 标定期间的所有 print() 经 _redirector 实时显示在系统事件日志框。
-    def _bg_calibrate():
-        hub.signal_log.emit("=" * 58)
-        hub.signal_log.emit("  [RF-Vision] 正在后台执行 S3 CAF-FFT 环境底噪校准...")
-        hub.signal_log.emit("  校准期间可正常操作界面，结果将实时显示于此日志框")
-        hub.signal_log.emit("  锁层警告：标定完成前「启动数据采集」按钮处于锁定状态")
-        hub.signal_log.emit("=" * 58)
-        _ok = True
-        try:
-            from rf_zynq.calibrate_s3 import main as _calibrate
-            _calibrate()
-            hub.signal_log.emit("  [RF-Vision] ✓ 底噪校准完成，新阈值已生效，「启动采集」已解锁。")
-        except Exception as _e:
-            _ok = False
-            hub.signal_log.emit(f"  [RF-Vision] ⚠ 校准出错: {_e}")
-            hub.signal_log.emit("  → 将使用上次保存的阈值，「启动采集」已释放。")
-        finally:
-            # 无论成功/失败均解锁按钮（失败时使用上次阈值仍可运行）
-            hub.signal_calibration_done.emit(_ok)
-
-    threading.Thread(target=_bg_calibrate, daemon=True).start()
+    # 统一走 Hub 的正式控制入口；正式模式下后续采集仍需 RA8P1 START_SCAN 放行。
+    hub.request_calibration(source="system_boot")
 
 
     # ── Step 5: 进入 Qt 主事件循环 ───────────────────────────────────────────

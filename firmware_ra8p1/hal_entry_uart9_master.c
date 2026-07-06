@@ -1,0 +1,821 @@
+#include "hal_data.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#define UART_CTRL g_uart9_ctrl
+#define UART_CFG  g_uart9_cfg
+
+#define UART_RX_RING_SIZE        512U
+#define LINE_BUFFER_SIZE         512U
+#define TX_BUFFER_SIZE           512U
+
+#define DETECT_WINDOW_SIZE       5U
+#define MEDIUM_WINDOW_SIZE       3U
+#define MEDIUM_CONFIRM_COUNT     2U
+#define WEAK_CONFIRM_COUNT       3U
+#define STRONG_SDS_THRESHOLD     1.35f
+#define STRONG_NCC_THRESHOLD     0.050f
+#define MEDIUM_SDS_THRESHOLD     1.00f
+#define WEAK_SDS_THRESHOLD       0.85f
+#define FREQ_MATCH_TOLERANCE_MHZ 60.0f
+#define ALERT_RELEASE_COUNT      5U
+
+#define LOOP_DELAY_MS            5U
+#define HEARTBEAT_TIMEOUT_MS     10000U
+#define START_SCAN_PERIOD_MS     1000U
+#define COMM_LED_PIN             BSP_IO_PORT_01_PIN_10
+#define COMM_LED_PULSE_MS        50U
+
+typedef enum
+{
+    RA_STATE_BOOT = 0,
+    RA_STATE_READY,
+    RA_STATE_SCANNING,
+    RA_STATE_CANDIDATE,
+    RA_STATE_ALERT,
+    RA_STATE_FAULT
+} ra_state_t;
+
+typedef enum
+{
+    MASTER_DECISION_CLEAR = 0,
+    MASTER_DECISION_CANDIDATE,
+    MASTER_DECISION_ALERT
+} master_decision_t;
+
+typedef struct
+{
+    bool valid;
+    bool rf_detected;
+    float freq_mhz;
+    float ncc;
+    float sds;
+} detection_sample_t;
+
+static volatile bool g_uart_tx_done = true;
+static volatile uint32_t g_rx_write_index = 0;
+static volatile uint32_t g_rx_read_index = 0;
+static volatile uint8_t g_rx_ring[UART_RX_RING_SIZE];
+
+static char g_line_buffer[LINE_BUFFER_SIZE];
+static uint32_t g_line_len = 0;
+
+static ra_state_t g_state = RA_STATE_BOOT;
+static uint16_t g_seq = 0;
+static uint32_t g_ms_ticks = 0;
+static uint32_t g_last_heartbeat_ms = 0;
+static uint32_t g_last_start_scan_ms = 0;
+static uint32_t g_comm_led_pulse_start_ms = 0;
+static bool g_comm_led_active = false;
+
+static detection_sample_t g_detect_history[DETECT_WINDOW_SIZE];
+static uint32_t g_detect_index = 0;
+static bool g_alert_latched = false;
+static uint32_t g_clear_streak = 0;
+
+static void app_init(void);
+static void app_loop(void);
+
+static bool uart_pop_char(char * c);
+static void uart_send_line(const char * line);
+static void process_rx_char(char c);
+static void process_line(char * line);
+
+static void handle_heartbeat(const char * line);
+static void handle_agent_ready(const char * line);
+static void handle_detection_report(const char * line);
+static void handle_reset_alert(void);
+
+static void send_start_scan(void);
+static void send_master_decision(master_decision_t decision, const char * reason);
+static void control_outputs_apply(master_decision_t decision, ra_state_t state);
+static void communication_led_init(void);
+static void communication_led_pulse(void);
+static void communication_led_update(void);
+static master_decision_t decide_from_window(bool rf_detected,
+                                            float freq_mhz,
+                                            float ncc,
+                                            float sds,
+                                            const char ** reason_out);
+static void reset_detection_window(void);
+static uint32_t count_recent_hits(uint32_t window_size, float min_sds, float center_freq_mhz);
+static bool freq_matches(float a_mhz, float b_mhz);
+static float abs_float(float value);
+
+static uint16_t next_seq(void);
+static uint32_t millis(void);
+static void delay_ms(uint32_t ms);
+
+static uint16_t checksum_string(const char * s);
+static uint16_t checksum_start_scan(uint16_t seq);
+static uint16_t checksum_master_decision(const char * decision,
+                                         const char * reason,
+                                         uint16_t seq,
+                                         uint32_t timestamp_ms);
+
+static bool json_get_bool(const char * json, const char * key, bool default_value);
+static float json_get_float(const char * json, const char * key, float default_value);
+static bool json_has_type(const char * json, const char * type_name);
+static const char * decision_to_string(master_decision_t decision);
+
+void hal_entry(void)
+{
+    app_init();
+
+    while (1)
+    {
+        app_loop();
+        delay_ms(LOOP_DELAY_MS);
+        g_ms_ticks += LOOP_DELAY_MS;
+    }
+}
+
+void UART9_Callback(uart_callback_args_t * p_args)
+{
+    if (NULL == p_args)
+    {
+        return;
+    }
+
+    switch (p_args->event)
+    {
+        case UART_EVENT_RX_CHAR:
+        {
+            uint32_t next = (g_rx_write_index + 1U) % UART_RX_RING_SIZE;
+            if (next != g_rx_read_index)
+            {
+                g_rx_ring[g_rx_write_index] = (uint8_t) p_args->data;
+                g_rx_write_index = next;
+            }
+            break;
+        }
+
+        case UART_EVENT_TX_COMPLETE:
+        {
+            g_uart_tx_done = true;
+            break;
+        }
+
+        case UART_EVENT_ERR_PARITY:
+        case UART_EVENT_ERR_FRAMING:
+        case UART_EVENT_ERR_OVERFLOW:
+        case UART_EVENT_BREAK_DETECT:
+        {
+            g_uart_tx_done = true;
+            g_state = RA_STATE_FAULT;
+            break;
+        }
+
+        default:
+        {
+            break;
+        }
+    }
+}
+
+void usb_pcdc_callback(usb_callback_args_t * p_args)
+{
+    (void) p_args;
+}
+
+static void app_init(void)
+{
+    memset(g_line_buffer, 0, sizeof(g_line_buffer));
+    g_line_len = 0U;
+    g_seq = 0U;
+    g_ms_ticks = 0U;
+    g_last_heartbeat_ms = 0U;
+    g_last_start_scan_ms = 0U;
+    g_comm_led_pulse_start_ms = 0U;
+    g_comm_led_active = false;
+    g_state = RA_STATE_BOOT;
+    g_alert_latched = false;
+    g_clear_streak = 0U;
+    reset_detection_window();
+
+    communication_led_init();
+
+    (void) R_SCI_B_UART_Open(&UART_CTRL, &UART_CFG);
+
+    g_state = RA_STATE_READY;
+    control_outputs_apply(MASTER_DECISION_CLEAR, g_state);
+    send_start_scan();
+}
+
+static void app_loop(void)
+{
+    char c = '\0';
+
+    communication_led_update();
+
+    while (uart_pop_char(&c))
+    {
+        process_rx_char(c);
+    }
+
+    if ((millis() - g_last_start_scan_ms) >= START_SCAN_PERIOD_MS)
+    {
+        if (RA_STATE_READY == g_state || RA_STATE_SCANNING == g_state)
+        {
+            send_start_scan();
+        }
+    }
+
+    if (g_last_heartbeat_ms > 0U)
+    {
+        if ((millis() - g_last_heartbeat_ms) > HEARTBEAT_TIMEOUT_MS)
+        {
+            g_state = RA_STATE_FAULT;
+            control_outputs_apply(MASTER_DECISION_CLEAR, g_state);
+            send_master_decision(MASTER_DECISION_CLEAR, "HEARTBEAT_TIMEOUT");
+            g_last_heartbeat_ms = millis();
+        }
+    }
+}
+
+static bool uart_pop_char(char * c)
+{
+    if (NULL == c)
+    {
+        return false;
+    }
+
+    if (g_rx_read_index == g_rx_write_index)
+    {
+        return false;
+    }
+
+    *c = (char) g_rx_ring[g_rx_read_index];
+    g_rx_read_index = (g_rx_read_index + 1U) % UART_RX_RING_SIZE;
+    return true;
+}
+
+static void uart_send_line(const char * line)
+{
+    if (NULL == line)
+    {
+        return;
+    }
+
+    uint32_t len = (uint32_t) strlen(line);
+    if (0U == len)
+    {
+        return;
+    }
+
+    uint32_t guard = 0U;
+    while (!g_uart_tx_done && guard < 200U)
+    {
+        delay_ms(1U);
+        guard++;
+    }
+
+    if (!g_uart_tx_done)
+    {
+        return;
+    }
+
+    g_uart_tx_done = false;
+    if (FSP_SUCCESS != R_SCI_B_UART_Write(&UART_CTRL, (uint8_t const *) line, len))
+    {
+        g_uart_tx_done = true;
+    }
+    else
+    {
+        communication_led_pulse();
+    }
+}
+
+static void process_rx_char(char c)
+{
+    if ('\0' == c || '\r' == c)
+    {
+        return;
+    }
+
+    if ('\n' == c)
+    {
+        g_line_buffer[g_line_len] = '\0';
+        if (g_line_len > 0U)
+        {
+            communication_led_pulse();
+            process_line(g_line_buffer);
+        }
+        g_line_len = 0U;
+        memset(g_line_buffer, 0, sizeof(g_line_buffer));
+        return;
+    }
+
+    if (g_line_len < (LINE_BUFFER_SIZE - 1U))
+    {
+        g_line_buffer[g_line_len] = c;
+        g_line_len++;
+    }
+    else
+    {
+        g_line_len = 0U;
+        memset(g_line_buffer, 0, sizeof(g_line_buffer));
+        g_state = RA_STATE_FAULT;
+        send_master_decision(MASTER_DECISION_CLEAR, "RX_LINE_OVERFLOW");
+    }
+}
+
+static void process_line(char * line)
+{
+    if (NULL == line)
+    {
+        return;
+    }
+
+    if (json_has_type(line, "HEARTBEAT"))
+    {
+        handle_heartbeat(line);
+        return;
+    }
+
+    if (json_has_type(line, "AGENT_READY"))
+    {
+        handle_agent_ready(line);
+        return;
+    }
+
+    if (json_has_type(line, "DETECTION_REPORT"))
+    {
+        handle_detection_report(line);
+        return;
+    }
+
+    if (json_has_type(line, "FAULT_REPORT"))
+    {
+        g_state = RA_STATE_FAULT;
+        send_master_decision(MASTER_DECISION_CLEAR, "AGENT_FAULT");
+        return;
+    }
+
+    if (json_has_type(line, "RESET_ALERT"))
+    {
+        handle_reset_alert();
+        return;
+    }
+}
+
+static void handle_heartbeat(const char * line)
+{
+    (void) line;
+    g_last_heartbeat_ms = millis();
+
+    if (RA_STATE_READY == g_state)
+    {
+        g_state = RA_STATE_SCANNING;
+    }
+}
+
+static void handle_agent_ready(const char * line)
+{
+    (void) line;
+    g_last_heartbeat_ms = millis();
+    if (RA_STATE_FAULT == g_state)
+    {
+        reset_detection_window();
+        g_alert_latched = false;
+        g_clear_streak = 0U;
+    }
+
+    if (RA_STATE_READY == g_state || RA_STATE_FAULT == g_state)
+    {
+        g_state = RA_STATE_SCANNING;
+    }
+
+    send_start_scan();
+}
+
+static void handle_detection_report(const char * line)
+{
+    bool rf_detected = json_get_bool(line, "rf_detected", false);
+    float freq_mhz = json_get_float(line, "freq_mhz", 0.0f);
+    float ncc = json_get_float(line, "ncc", 0.0f);
+    float sds = json_get_float(line, "sds", 0.0f);
+
+    const char * reason = "NO_RF";
+    master_decision_t decision = decide_from_window(rf_detected, freq_mhz, ncc, sds, &reason);
+
+    if (MASTER_DECISION_ALERT == decision)
+    {
+        g_state = RA_STATE_ALERT;
+    }
+    else if (MASTER_DECISION_CANDIDATE == decision)
+    {
+        g_state = RA_STATE_CANDIDATE;
+    }
+    else
+    {
+        g_state = RA_STATE_SCANNING;
+    }
+
+    control_outputs_apply(decision, g_state);
+    send_master_decision(decision, reason);
+}
+
+static void handle_reset_alert(void)
+{
+    reset_detection_window();
+    g_alert_latched = false;
+    g_clear_streak = 0U;
+    g_state = RA_STATE_SCANNING;
+    control_outputs_apply(MASTER_DECISION_CLEAR, g_state);
+    send_master_decision(MASTER_DECISION_CLEAR, "RESET_ALERT");
+}
+
+static void control_outputs_apply(master_decision_t decision, ra_state_t state)
+{
+    /*
+     * Formal competition output hook.
+     *
+     * RA8P1 is the only module that should drive final alarm outputs. Keep all
+     * LED, buzzer, relay, or judge-interface pin writes in this function once
+     * the actual CPKHMI-RA8P1 carrier pin mapping is fixed in FSP.
+     *
+     * Intended mapping:
+     *   state == RA_STATE_FAULT            -> fault output active
+     *   decision == MASTER_DECISION_ALERT  -> alarm output active
+     *   decision == MASTER_DECISION_CANDIDATE -> candidate/status output active
+     *   decision == MASTER_DECISION_CLEAR  -> alarm output inactive
+     */
+    (void) decision;
+    (void) state;
+}
+
+static void communication_led_init(void)
+{
+    (void) R_IOPORT_PinCfg(&g_ioport_ctrl, COMM_LED_PIN, IOPORT_CFG_PORT_DIRECTION_OUTPUT);
+    (void) R_IOPORT_PinWrite(&g_ioport_ctrl, COMM_LED_PIN, BSP_IO_LEVEL_LOW);
+}
+
+static void communication_led_pulse(void)
+{
+    (void) R_IOPORT_PinWrite(&g_ioport_ctrl, COMM_LED_PIN, BSP_IO_LEVEL_HIGH);
+    g_comm_led_pulse_start_ms = millis();
+    g_comm_led_active = true;
+}
+
+static void communication_led_update(void)
+{
+    if (!g_comm_led_active)
+    {
+        return;
+    }
+
+    if ((millis() - g_comm_led_pulse_start_ms) >= COMM_LED_PULSE_MS)
+    {
+        (void) R_IOPORT_PinWrite(&g_ioport_ctrl, COMM_LED_PIN, BSP_IO_LEVEL_LOW);
+        g_comm_led_active = false;
+    }
+}
+
+static master_decision_t decide_from_window(bool rf_detected,
+                                            float freq_mhz,
+                                            float ncc,
+                                            float sds,
+                                            const char ** reason_out)
+{
+    g_detect_history[g_detect_index].valid = true;
+    g_detect_history[g_detect_index].rf_detected = rf_detected;
+    g_detect_history[g_detect_index].freq_mhz = freq_mhz;
+    g_detect_history[g_detect_index].ncc = ncc;
+    g_detect_history[g_detect_index].sds = sds;
+    g_detect_index = (g_detect_index + 1U) % DETECT_WINDOW_SIZE;
+
+    if (g_alert_latched)
+    {
+        if (rf_detected && sds >= WEAK_SDS_THRESHOLD)
+        {
+            g_clear_streak = 0U;
+            *reason_out = "ALERT_LATCHED";
+            return MASTER_DECISION_ALERT;
+        }
+
+        g_clear_streak++;
+        if (g_clear_streak >= ALERT_RELEASE_COUNT)
+        {
+            g_alert_latched = false;
+            g_clear_streak = 0U;
+            reset_detection_window();
+            *reason_out = "ALERT_RELEASED_CLEAR_WINDOW";
+            return MASTER_DECISION_CLEAR;
+        }
+
+        *reason_out = "ALERT_LATCHED";
+        return MASTER_DECISION_ALERT;
+    }
+
+    if (rf_detected && (sds >= STRONG_SDS_THRESHOLD || ncc >= STRONG_NCC_THRESHOLD))
+    {
+        g_alert_latched = true;
+        g_clear_streak = 0U;
+        *reason_out = "RF_STRONG_SINGLE_PASS";
+        return MASTER_DECISION_ALERT;
+    }
+
+    if (rf_detected)
+    {
+        uint32_t medium_hits = count_recent_hits(MEDIUM_WINDOW_SIZE, MEDIUM_SDS_THRESHOLD, freq_mhz);
+        if (medium_hits >= MEDIUM_CONFIRM_COUNT)
+        {
+            g_alert_latched = true;
+            g_clear_streak = 0U;
+            *reason_out = "RF_2_OF_3_FREQ_SDS_PASS";
+            return MASTER_DECISION_ALERT;
+        }
+
+        uint32_t weak_hits = count_recent_hits(DETECT_WINDOW_SIZE, WEAK_SDS_THRESHOLD, freq_mhz);
+        if (weak_hits >= WEAK_CONFIRM_COUNT)
+        {
+            g_alert_latched = true;
+            g_clear_streak = 0U;
+            *reason_out = "RF_3_OF_5_WEAK_FREQ_PASS";
+            return MASTER_DECISION_ALERT;
+        }
+
+        if (sds >= WEAK_SDS_THRESHOLD)
+        {
+            *reason_out = "RF_CANDIDATE_SDS";
+            return MASTER_DECISION_CANDIDATE;
+        }
+
+        *reason_out = "RF_CANDIDATE";
+        return MASTER_DECISION_CANDIDATE;
+    }
+
+    *reason_out = "NO_RF";
+    return MASTER_DECISION_CLEAR;
+}
+
+static void reset_detection_window(void)
+{
+    for (uint32_t i = 0U; i < DETECT_WINDOW_SIZE; i++)
+    {
+        g_detect_history[i].valid = false;
+        g_detect_history[i].rf_detected = false;
+        g_detect_history[i].freq_mhz = 0.0f;
+        g_detect_history[i].ncc = 0.0f;
+        g_detect_history[i].sds = 0.0f;
+    }
+    g_detect_index = 0U;
+}
+
+static uint32_t count_recent_hits(uint32_t window_size, float min_sds, float center_freq_mhz)
+{
+    uint32_t hit_count = 0U;
+
+    if (window_size > DETECT_WINDOW_SIZE)
+    {
+        window_size = DETECT_WINDOW_SIZE;
+    }
+
+    for (uint32_t i = 0U; i < window_size; i++)
+    {
+        uint32_t offset = i + 1U;
+        uint32_t index = (g_detect_index + DETECT_WINDOW_SIZE - offset) % DETECT_WINDOW_SIZE;
+        detection_sample_t * sample = &g_detect_history[index];
+
+        if (!sample->valid || !sample->rf_detected)
+        {
+            continue;
+        }
+
+        if (sample->sds < min_sds)
+        {
+            continue;
+        }
+
+        if (!freq_matches(sample->freq_mhz, center_freq_mhz))
+        {
+            continue;
+        }
+
+        hit_count++;
+    }
+
+    return hit_count;
+}
+
+static bool freq_matches(float a_mhz, float b_mhz)
+{
+    if (a_mhz <= 0.0f || b_mhz <= 0.0f)
+    {
+        return true;
+    }
+
+    return abs_float(a_mhz - b_mhz) <= FREQ_MATCH_TOLERANCE_MHZ;
+}
+
+static float abs_float(float value)
+{
+    return value < 0.0f ? -value : value;
+}
+
+static void send_start_scan(void)
+{
+    char tx[TX_BUFFER_SIZE];
+    uint16_t seq = next_seq();
+    uint16_t checksum = checksum_start_scan(seq);
+
+    snprintf(tx,
+             sizeof(tx),
+             "{\"type\":\"START_SCAN\",\"seq\":%u,\"checksum\":%u}\n",
+             (unsigned int) seq,
+             (unsigned int) checksum);
+
+    uart_send_line(tx);
+    g_last_start_scan_ms = millis();
+}
+
+static void send_master_decision(master_decision_t decision, const char * reason)
+{
+    char tx[TX_BUFFER_SIZE];
+    uint16_t seq = next_seq();
+    uint32_t timestamp_ms = millis();
+    const char * decision_str = decision_to_string(decision);
+
+    if (NULL == reason)
+    {
+        reason = "UNKNOWN";
+    }
+
+    uint16_t checksum = checksum_master_decision(decision_str, reason, seq, timestamp_ms);
+
+    snprintf(tx,
+             sizeof(tx),
+             "{\"type\":\"MASTER_DECISION\",\"seq\":%u,\"decision\":\"%s\",\"reason\":\"%s\",\"timestamp_ms\":%lu,\"checksum\":%u}\n",
+             (unsigned int) seq,
+             decision_str,
+             reason,
+             (unsigned long) timestamp_ms,
+             (unsigned int) checksum);
+
+    uart_send_line(tx);
+}
+
+static uint16_t checksum_string(const char * s)
+{
+    uint32_t sum = 0U;
+
+    if (NULL == s)
+    {
+        return 0U;
+    }
+
+    while ('\0' != *s)
+    {
+        sum += (uint8_t) (*s);
+        s++;
+    }
+
+    return (uint16_t) (sum & 0xFFFFU);
+}
+
+static uint16_t checksum_start_scan(uint16_t seq)
+{
+    char body[128];
+
+    snprintf(body, sizeof(body), "{\"seq\":%u,\"type\":\"START_SCAN\"}", (unsigned int) seq);
+    return checksum_string(body);
+}
+
+static uint16_t checksum_master_decision(const char * decision,
+                                         const char * reason,
+                                         uint16_t seq,
+                                         uint32_t timestamp_ms)
+{
+    char body[TX_BUFFER_SIZE];
+
+    snprintf(body,
+             sizeof(body),
+             "{\"decision\":\"%s\",\"reason\":\"%s\",\"seq\":%u,\"timestamp_ms\":%lu,\"type\":\"MASTER_DECISION\"}",
+             decision,
+             reason,
+             (unsigned int) seq,
+             (unsigned long) timestamp_ms);
+
+    return checksum_string(body);
+}
+
+static bool json_has_type(const char * json, const char * type_name)
+{
+    char pattern[96];
+
+    if (NULL == json || NULL == type_name)
+    {
+        return false;
+    }
+
+    snprintf(pattern, sizeof(pattern), "\"type\":\"%s\"", type_name);
+    return NULL != strstr(json, pattern);
+}
+
+static bool json_get_bool(const char * json, const char * key, bool default_value)
+{
+    char pattern_true[96];
+    char pattern_false[96];
+
+    if (NULL == json || NULL == key)
+    {
+        return default_value;
+    }
+
+    snprintf(pattern_true, sizeof(pattern_true), "\"%s\":true", key);
+    snprintf(pattern_false, sizeof(pattern_false), "\"%s\":false", key);
+
+    if (NULL != strstr(json, pattern_true))
+    {
+        return true;
+    }
+
+    if (NULL != strstr(json, pattern_false))
+    {
+        return false;
+    }
+
+    return default_value;
+}
+
+static float json_get_float(const char * json, const char * key, float default_value)
+{
+    char pattern[64];
+    char * p = NULL;
+    float value = default_value;
+
+    if (NULL == json || NULL == key)
+    {
+        return default_value;
+    }
+
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    p = strstr(json, pattern);
+
+    if (NULL == p)
+    {
+        return default_value;
+    }
+
+    p += strlen(pattern);
+
+    if (1 == sscanf(p, "%f", &value))
+    {
+        return value;
+    }
+
+    return default_value;
+}
+
+static const char * decision_to_string(master_decision_t decision)
+{
+    switch (decision)
+    {
+        case MASTER_DECISION_ALERT:
+            return "ALERT";
+
+        case MASTER_DECISION_CANDIDATE:
+            return "CANDIDATE";
+
+        case MASTER_DECISION_CLEAR:
+        default:
+            return "CLEAR";
+    }
+}
+
+static uint16_t next_seq(void)
+{
+    g_seq++;
+    if (0U == g_seq)
+    {
+        g_seq = 1U;
+    }
+
+    return g_seq;
+}
+
+static uint32_t millis(void)
+{
+    return g_ms_ticks;
+}
+
+static void delay_ms(uint32_t ms)
+{
+    R_BSP_SoftwareDelay(ms, BSP_DELAY_UNITS_MILLISECONDS);
+}
+
+#if BSP_TZ_SECURE_BUILD
+
+FSP_CPP_HEADER
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable();
+
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable()
+{
+}
+FSP_CPP_FOOTER
+
+#endif

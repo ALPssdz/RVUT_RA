@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ui_qt/gui_host.py — RF-Vision 主上位机界面（现代化重构版）
+ui_qt/gui_host.py — RF-RA8P1 外置算力显示终端界面
 ==========================================================
 基于 PyQt5 的深色玻璃拟态（Glassmorphism）风格主控界面。
 
@@ -499,7 +499,7 @@ class StatusBannerCard(QFrame):
 # ──────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     """
-    RF-RA8P1 主上位机表现层。
+    RF-RA8P1 外置算力显示终端表现层。
 
     严格视图层：零业务逻辑，与 CentralHubEngine 通过 Qt 信号槽单向连接。
     """
@@ -561,6 +561,7 @@ class MainWindow(QMainWindow):
 
         # ── 告警计数器 ────────────────────────────────────────────────
         self._alert_count = 0
+        self._last_alert_active = False
 
         # ── 香橙派系统监控 ────────────────────────────────────────────
         self._setup_orangepi_monitor()
@@ -573,7 +574,7 @@ class MainWindow(QMainWindow):
     # 橙派监控初始化
     # ==================================================================
     def _setup_orangepi_monitor(self):
-        """启动本地 psutil 系统资源监控器（上位机直接运行于香橙派本地）。"""
+        """启动本地 psutil 系统资源监控器（显示终端直接运行于香橙派本地）。"""
         self._opi_monitor = OrangePiMonitor(
             interval_s=2.0,
             net_iface="eth0",
@@ -638,7 +639,7 @@ class MainWindow(QMainWindow):
         lbl_sub.setStyleSheet(f"color: {PALETTE['text_muted']}; font-size: 12px; margin-left: 12px;")
 
         # 右侧：版本
-        lbl_ver = QLabel("UART 921600  ·  HDMI Console")
+        lbl_ver = QLabel("JDBG VCOM SCI9  ·  HDMI Console")
         lbl_ver.setStyleSheet(f"color: {PALETTE['text_muted']}; font-size: 11px;")
 
         lay.addWidget(lbl_brand)
@@ -660,7 +661,7 @@ class MainWindow(QMainWindow):
         banner.setSpacing(10)
 
         self._card_sdr     = StatusBannerCard("SDR 射频节点", "PlutoSDR  ·  休眠",   PALETTE['accent_blue'])
-        self._card_ra8p1   = StatusBannerCard("RA8P1 主控",   "UART 921600  ·  待接入", PALETTE['accent_amber'])
+        self._card_ra8p1   = StatusBannerCard("RA8P1 主控",   "JDBG UART /dev/ttyACM0  ·  待接入", PALETTE['accent_amber'])
         self._card_system  = StatusBannerCard("系统状态",     "待机  ·  等待主控指令", PALETTE['accent_cyan'])
 
         # 告警计数器卡片
@@ -724,42 +725,49 @@ class MainWindow(QMainWindow):
         ra8p1_card_lay.setContentsMargins(0, 0, 0, 0)
         ra8p1_card_lay.setSpacing(0)
 
-        ra8p1_hdr = self._make_card_header("◇  RA8P1 主控裁决台", PALETTE['accent_amber'])
+        ra8p1_hdr = self._make_card_header("◇  RA8P1 最终裁决与证据状态", PALETTE['accent_amber'])
         ra8p1_card_lay.addWidget(ra8p1_hdr)
 
         ra8p1_body = QVBoxLayout()
-        ra8p1_body.setContentsMargins(20, 20, 20, 20)
-        ra8p1_body.setSpacing(14)
+        ra8p1_body.setContentsMargins(18, 18, 18, 18)
+        ra8p1_body.setSpacing(10)
 
         self.lbl_ra8p1_decision = QLabel("PENDING")
         self.lbl_ra8p1_decision.setAlignment(Qt.AlignCenter)
-        self.lbl_ra8p1_decision.setMinimumHeight(96)
+        self.lbl_ra8p1_decision.setMinimumHeight(86)
         self.lbl_ra8p1_decision.setStyleSheet(f"""
             color: {PALETTE['accent_amber']};
             background-color: #090d16;
             border: 1px solid {PALETTE['border']};
             border-radius: 8px;
-            font-size: 34px;
+            font-size: 32px;
             font-weight: 800;
         """)
 
-        self.lbl_ra8p1_link = QLabel("UART 921600  ·  待接入")
-        self.lbl_ra8p1_reason = QLabel("等待 RA8P1 主控链路接入；当前为 RF Agent 本地过渡模式")
-        for lbl in [self.lbl_ra8p1_link, self.lbl_ra8p1_reason]:
+        self.lbl_ra8p1_link = QLabel("JDBG UART /dev/ttyACM0  ·  待接入")
+        self.lbl_final_reason = QLabel("最终原因：等待 RF 证据与 RA8P1 主控确认")
+        self.lbl_ra8p1_raw = QLabel("RA8P1实时回包：PENDING / 等待回包")
+        self.lbl_rf_progress = QLabel("RF确认进度：未开始")
+        self.lbl_rf_metrics = QLabel("当前指标：Freq -- | NCC -- | SDS -- | YOLO --")
+        for lbl in [
+            self.lbl_ra8p1_link,
+            self.lbl_final_reason,
+            self.lbl_ra8p1_raw,
+            self.lbl_rf_progress,
+            self.lbl_rf_metrics,
+        ]:
             lbl.setWordWrap(True)
             lbl.setStyleSheet(f"""
                 color: {PALETTE['text_secondary']};
                 background-color: #090d16;
                 border: 1px solid {PALETTE['border']};
                 border-radius: 8px;
-                padding: 12px;
-                font-size: 13px;
+                padding: 10px;
+                font-size: 12px;
             """)
 
         rf_role = QLabel(
-            "RA8P1: 主控状态机与最终告警裁决\n"
-            "RK3588: RF 检测算法协处理与 HDMI 大屏\n"
-            "UART: 控制命令、检测报告、主控裁决"
+            "大字仅显示最终判决；RA8P1 回包与 RF 候选过程在下方分项显示。"
         )
         rf_role.setWordWrap(True)
         rf_role.setStyleSheet(f"""
@@ -772,7 +780,10 @@ class MainWindow(QMainWindow):
 
         ra8p1_body.addWidget(self.lbl_ra8p1_decision)
         ra8p1_body.addWidget(self.lbl_ra8p1_link)
-        ra8p1_body.addWidget(self.lbl_ra8p1_reason)
+        ra8p1_body.addWidget(self.lbl_final_reason)
+        ra8p1_body.addWidget(self.lbl_ra8p1_raw)
+        ra8p1_body.addWidget(self.lbl_rf_progress)
+        ra8p1_body.addWidget(self.lbl_rf_metrics)
         ra8p1_body.addStretch()
         ra8p1_body.addWidget(rf_role)
         ra8p1_card_lay.addLayout(ra8p1_body, stretch=1)
@@ -1065,8 +1076,8 @@ class MainWindow(QMainWindow):
         if "ra8p1" in status_dict:
             self._card_ra8p1.update_status(status_dict["ra8p1"])
             self.lbl_ra8p1_link.setText(status_dict["ra8p1"])
-        if "master_decision" in status_dict:
-            decision = status_dict["master_decision"]
+        if "final_decision" in status_dict:
+            decision = status_dict["final_decision"]
             self.lbl_ra8p1_decision.setText(decision)
             color = PALETTE['accent_red'] if decision == "ALERT" else PALETTE['accent_amber']
             if decision == "CLEAR":
@@ -1076,20 +1087,32 @@ class MainWindow(QMainWindow):
                 background-color: #090d16;
                 border: 1px solid {PALETTE['border']};
                 border-radius: 8px;
-                font-size: 34px;
+                font-size: 32px;
                 font-weight: 800;
             """)
-        if "decision_reason" in status_dict:
-            self.lbl_ra8p1_reason.setText(status_dict["decision_reason"])
+        if "final_reason" in status_dict:
+            self.lbl_final_reason.setText(f"最终原因：{status_dict['final_reason']}")
+        if "ra8p1_raw_decision" in status_dict or "ra8p1_raw_reason" in status_dict:
+            raw_decision = status_dict.get("ra8p1_raw_decision", "PENDING")
+            raw_reason = status_dict.get("ra8p1_raw_reason", "")
+            self.lbl_ra8p1_raw.setText(f"RA8P1实时回包：{raw_decision} / {raw_reason}")
+        if "rf_progress" in status_dict:
+            self.lbl_rf_progress.setText(f"RF确认进度：{status_dict['rf_progress']}")
+        if "rf_metrics" in status_dict:
+            self.lbl_rf_metrics.setText(f"当前指标：{status_dict['rf_metrics']}")
         if "system" in status_dict:
             active = "△" in status_dict["system"] or "●" in status_dict["system"]
             color = status_dict.get("color", PALETTE['accent_cyan'])
             self._card_system.update_status(status_dict["system"], active=active, color=color)
+        if "pipeline_running" in status_dict:
+            self._set_play_button_running(bool(status_dict["pipeline_running"]))
 
         # 告警检测
-        if status_dict.get("color", "") == "#e74c3c":
+        alert_active = bool(status_dict.get("alert", False))
+        if alert_active and not self._last_alert_active:
             self._alert_count += 1
             self._card_alert.update_status(f"{self._alert_count} 次告警", active=True, color=PALETTE['accent_red'])
+        self._last_alert_active = alert_active
 
     def append_log(self, text: str):
         html_text = text.replace('\n', '<br>')
@@ -1102,42 +1125,45 @@ class MainWindow(QMainWindow):
         if not self.hub:
             return
         if self.hub.running:
-            self.hub.stop_sensing()
-            self.btn_play.setText("▶  启动数据采集")
-            self.btn_play.setObjectName("btn_start")
-            self.btn_play.setStyleSheet("")   # 重置样式触发 QSS 重新解析
-            self.btn_play.setStyle(self.btn_play.style())
+            self.hub.stop_sensing(source="local_operator")
+            self._set_play_button_running(False)
         else:
-            self.hub.start_sensing()
+            started = self.hub.start_sensing(source="local")
+            self._set_play_button_running(started)
+
+    def _set_play_button_running(self, running: bool):
+        if running:
             self.btn_play.setText("||  停止采集管道")
             self.btn_play.setObjectName("btn_stop")
-            self.btn_play.setStyleSheet("")
-            self.btn_play.setStyle(self.btn_play.style())
+        else:
+            self.btn_play.setText("▶  等待 RA8P1 启动")
+            self.btn_play.setObjectName("btn_start")
+        self.btn_play.setStyleSheet("")
+        self.btn_play.setStyle(self.btn_play.style())
 
     def on_calibration_done(self, success: bool):
         """
         背景噪声标定完成回调（由 signal_calibration_done 触发）。
 
-        标定成功：恢复绿色「启动数据采集」按钮，解除交互锁定。
-        标定失败：以琥珀色提示，仍解锁按钮（使用上次阈值亦可运行）。
+        标定成功：解除交互锁定；正式模式下等待 RA8P1 START_SCAN。
+        标定失败：保持启动锁定，正式模式不允许使用旧阈值继续检测。
         """
-        self.btn_play.setEnabled(True)
         self.btn_play.setStyleSheet("")        # 清除灰色锁定样式
         self.btn_play.setStyle(self.btn_play.style())
 
         if success:
-            self.btn_play.setText("▶  启动数据采集")
+            self.btn_play.setEnabled(True)
+            self.btn_play.setText("▶  等待 RA8P1 启动")
             self.btn_play.setObjectName("btn_start")
             self.btn_play.setStyleSheet("")
         else:
-            # 标定失败时用琥珀色警示，功能仍可用
-            self.btn_play.setText("⚠  启动（阈值降级）")
+            self.btn_play.setEnabled(False)
+            self.btn_play.setText("⚠  强制标定失败，禁止启动")
             self.btn_play.setObjectName("btn_start")
             self.btn_play.setStyleSheet("""
                 QPushButton {
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                        stop:0 #78350f, stop:1 #f59e0b);
-                    color: #fff8e1;
+                    background: #4b5563;
+                    color: #f9fafb;
                     border-radius: 7px;
                 }
             """)

@@ -14,7 +14,7 @@ PROJ_ROOT = __import__("os").path.dirname(__import__("os").path.dirname(__file__
 if PROJ_ROOT not in sys.path:
     sys.path.insert(0, PROJ_ROOT)
 
-from protocol.uart_protocol import RA8P1Protocol, ROLE_MASTER, decode_message, encode_message
+from protocol.link_protocol import RA8P1Protocol, ROLE_MASTER, decode_message, encode_message
 
 
 def decide(report: dict) -> str:

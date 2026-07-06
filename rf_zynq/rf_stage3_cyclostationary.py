@@ -126,7 +126,12 @@ class RF_Stage3_CycloAudit:
     SDS_W_AFS = 0.10
 
     # SDS 综合评分判决阈值
-    SDS_COMPOSITE_THRESHOLD = 1.0
+    SDS_COMPOSITE_THRESHOLD = 1.08
+
+    # 正式版误报抑制：SDS 不能单独放行，必须通过物理硬验证。
+    # 普通信号要求 PSR、CFS、AFS 全部通过；强 NCC 旁路也至少要求
+    # PSR 通过，且 CFS/AFS 二者之一通过。
+    STRICT_HARD_VALIDATION = True
 
     # 软下限系数：允许 NCC 轻微低于阈值（0.80×th）的信号在其他证据充分时被检出
     # 物理含义：弱信号突发帧 NCC 可能因信噪比不足而低于标定阈值 20%，
@@ -577,7 +582,28 @@ class RF_Stage3_CycloAudit:
 
         ncc_soft_ok = triggered_score >= self.SDS_SOFT_NCC_FLOOR_RATIO * th_active
 
-        if is_strong_bypass:
+        psr_pass = psr >= psr_th
+        cfs_pass = cfs_best >= self.CFS_THRESHOLD
+        hard_valid = (psr_pass and cfs_pass and afs_pass)
+        strong_hard_valid = (psr_pass and (cfs_pass or afs_pass))
+
+        if self.STRICT_HARD_VALIDATION and is_strong_bypass and not strong_hard_valid:
+            decision = False
+            decision_reason = (
+                "HARD_VALIDATION_FAIL_STRONG"
+                f"(PSR={'PASS' if psr_pass else 'FAIL'},"
+                f" CFS={'PASS' if cfs_pass else 'FAIL'},"
+                f" AFS={'PASS' if afs_pass else 'FAIL'})"
+            )
+        elif self.STRICT_HARD_VALIDATION and not is_strong_bypass and not hard_valid:
+            decision = False
+            decision_reason = (
+                "HARD_VALIDATION_FAIL"
+                f"(PSR={'PASS' if psr_pass else 'FAIL'},"
+                f" CFS={'PASS' if cfs_pass else 'FAIL'},"
+                f" AFS={'PASS' if afs_pass else 'FAIL'})"
+            )
+        elif is_strong_bypass:
             decision = True
             decision_reason = f"BYPASS(NCC={triggered_score*100:.2f}% ≥ {self.SDS_STRONG_BYPASS_RATIO:.1f}×th)"
         elif sds_score >= self.SDS_COMPOSITE_THRESHOLD and ncc_soft_ok:
